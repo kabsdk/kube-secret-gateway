@@ -16,8 +16,8 @@ remains the final authority over which Secrets it can read.
 - Secrets are watched, so changes, deletions and re-creations take effect
   immediately, and their state is visible in Prometheus metrics before any
   client asks for them.
-- There is no listing endpoint: a client has to know both the exposure name
-  and the key.
+- There is no listing endpoint: a client has to know the exposure name. One
+  request can fetch every key of an exposure as a consistent set.
 
 ## Contents
 
@@ -26,6 +26,8 @@ remains the final authority over which Secrets it can read.
   - [How it works](#how-it-works)
   - [HTTP interface](#http-interface)
     - [Fetching a value](#fetching-a-value)
+    - [Fetching a bundle](#fetching-a-bundle)
+    - [Polling for changes](#polling-for-changes)
     - [Status codes](#status-codes)
   - [Configuration](#configuration)
     - [Exposures](#exposures)
@@ -83,10 +85,10 @@ config.yaml ──> exposures ──> unique Secret references (source + auth)
 
 The gateway listens on two ports.
 
-| Listener | Default | Paths                                         |
-| -------- | ------- | --------------------------------------------- |
-| Secrets  | `:8080` | `GET /secrets/{exposure}/{key}` only          |
-| Metrics  | `:8081` | `GET /healthz`, `GET /readyz`, `GET /metrics` |
+| Listener | Default | Paths                                                        |
+| -------- | ------- | ------------------------------------------------------------ |
+| Secrets  | `:8080` | `GET /secrets/{exposure}/{key}`, `GET /bundles/{exposure}`   |
+| Metrics  | `:8081` | `GET /healthz`, `GET /readyz`, `GET /metrics`                 |
 
 Route only the Secrets listener through your ingress. The metrics listener is
 for the kubelet and Prometheus.
@@ -111,38 +113,78 @@ ETag: "hmac-sha256:…"
 
 `HEAD` works like `GET` without the body, and query strings are ignored.
 
+### Fetching a bundle
+
+`GET /bundles/{exposure}` returns every key the exposure serves, from one read
+of one incarnation of the Secret, under a single `ETag`.
+
+```sh
+curl -fsS --user "fetcher:$PASSWORD" \
+  https://gateway.example.com/bundles/my-cert
+```
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+Cache-Control: no-store
+X-Content-Type-Options: nosniff
+ETag: "hmac-sha256:…"
+
+{"ca.crt":"Q0E=","tls.crt":"LS0tLS1CRUdJTi…","tls.key":"LS0tLS1CRUdJTi…"}
+```
+
+Values are base64 so that arbitrary bytes survive JSON. Keys are sorted, so
+the body is byte-for-byte identical for a given Secret version and exposure.
+
+Use this route whenever several keys belong together, such as a certificate
+and its private key. One request cannot straddle an update, so the set is
+always internally consistent, and the single `ETag` changes when *any* key in
+it changes. Fetching the keys one at a time gives neither guarantee: a
+renewal can land between two requests, leaving a new certificate next to an
+old key.
+
+`includeKeys` and `excludeKeys` decide what a bundle contains, exactly as
+they decide which single keys exist. A bundle is never partial: if
+`includeKeys` names a key the Secret does not have, the whole request is
+`503`, and nothing is served.
+
+`HEAD` works like `GET` without the body, and query strings are ignored. There
+is still no way to list exposures, and a bundle reveals nothing that probing
+single keys with valid credentials would not.
+
 ### Polling for changes
 
 Clients that poll should use the `ETag`:
 
-1. Store the `ETag` of each value you install.
+1. Store the `ETag` of what you installed.
 2. On the next poll, send it back as `If-None-Match`.
-3. `304 Not Modified` (no body) means the value is unchanged: don't rewrite
-   the file and don't reload anything. `200` means it changed.
+3. `304 Not Modified` (no body) means nothing changed: don't rewrite any file
+   and don't reload anything. `200` means it changed.
 
-The tag changes exactly when the value changes; recreating a Secret also
-changes it once.
+The tag changes exactly when the bytes it describes change; recreating a
+Secret also changes it once.
 
-When several keys belong together, such as a certificate and its private
-key, one more thing matters. Each request returns one key, so a renewal can
-land between two requests, leaving a new certificate next to an old key.
-After fetching, ask for every key again with its new `ETag`: if all answer
-`304`, the set is consistent. Otherwise, install nothing and retry later.
+Poll `/bundles/{exposure}` rather than individual keys. One conditional
+request then answers, for the whole set at once, whether anything a client
+installs has changed, and a `200` carries a consistent set.
 
-This Python script (standard library only) does all of that. It installs
-files atomically, readable by their owner only, and runs a command after a
-change:
+[kube-secret-gateway-client](../kube-secret-gateway-client) is a small
+static binary that does this, with several bundles on independent intervals,
+atomic installs and a command to run after a change.
+
+Without it, this is the whole job in standard-library Python. Run it from a
+systemd timer or cron:
 
 ```python
 #!/usr/bin/env python3
-"""Mirror keys of one kube-secret-gateway exposure into local files.
+"""Mirror one kube-secret-gateway exposure into local files.
 
-Run it periodically, for example from a systemd timer or cron. It downloads
-only values that changed, replaces files atomically, never installs a set of
-values that straddles an update of the Secret, and runs a command when
-something changed.
+Downloads nothing when the bundle is unchanged, replaces files atomically,
+never installs a set of values that straddles an update of the Secret, and
+runs a command when something changed.
 """
 import base64
+import json
 import os
 import subprocess
 import sys
@@ -150,70 +192,63 @@ import tempfile
 import urllib.error
 import urllib.request
 
-EXPOSURE_URL = "https://gateway.example.com/secrets/my-cert"
+BUNDLE_URL = "https://gateway.example.com/bundles/my-cert"
 FILES = {  # Secret key -> local file
     "tls.crt": "/etc/ssl/my-cert/tls.crt",
     "tls.key": "/etc/ssl/my-cert/tls.key",
 }
 CREDENTIALS = "/etc/secret-fetcher/credentials"  # "username:password", mode 0600
+STATE = "/var/lib/secret-fetcher/my-cert.etag"
 ON_CHANGE = ["systemctl", "reload", "nginx"]  # or None
-
-
-def get(key, etag, auth):
-    """Fetch one key. Returns (value, etag), or None if it is unchanged."""
-    request = urllib.request.Request(f"{EXPOSURE_URL}/{key}", headers={"Authorization": auth})
-    if etag:
-        request.add_header("If-None-Match", etag)
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            return response.read(), response.headers["ETag"]
-    except urllib.error.HTTPError as err:
-        if err.code == 304:
-            return None
-        raise
-
-
-def stored_etag(path):
-    """The ETag of the installed file, or None if there is no file."""
-    try:
-        with open(path + ".etag") as f:
-            return f.read().strip() if os.path.exists(path) else None
-    except FileNotFoundError:
-        return None
 
 
 def install(path, data):
     """Replace path atomically. The new file is readable by its owner only."""
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
-    with os.fdopen(fd, "wb") as f:
-        f.write(data)
-    os.replace(tmp, path)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
 
 
 def main():
     with open(CREDENTIALS, "rb") as f:
         auth = "Basic " + base64.b64encode(f.read().rstrip(b"\n")).decode()
+    headers = {"Authorization": auth}
 
-    etags = {key: stored_etag(path) for key, path in FILES.items()}
-    changed = {}
-    for key in FILES:
-        result = get(key, etags[key], auth)
-        if result:
-            changed[key] = result
-    if not changed:
-        return
+    # Only send the stored ETag if every file it describes is still in place.
+    if all(os.path.exists(path) for path in FILES.values()):
+        try:
+            with open(STATE) as f:
+                headers["If-None-Match"] = f.read().strip()
+        except FileNotFoundError:
+            pass
 
-    # The Secret may have been updated between two of the requests above, and
-    # a certificate must never be installed next to a key from another
-    # version. Ask for every key again: all must still be unchanged (304).
-    for key in FILES:
-        etag = changed[key][1] if key in changed else etags[key]
-        if get(key, etag, auth) is not None:
-            sys.exit(f"{key} changed while fetching; the next run will retry")
+    request = urllib.request.Request(BUNDLE_URL, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            bundle, etag = json.load(response), response.headers["ETag"]
+    except urllib.error.HTTPError as err:
+        if err.code == 304:
+            return
+        raise
 
-    for key, (value, etag) in changed.items():
-        install(FILES[key], value)
-        install(FILES[key] + ".etag", etag.encode())
+    missing = sorted(key for key in FILES if key not in bundle)
+    if missing:
+        sys.exit(f"the exposure does not serve {', '.join(missing)}")
+
+    # One response is one version of the Secret, so these values belong
+    # together. The ETag is stored last: a crash before that leaves a stale
+    # tag, and the next run simply fetches and installs again.
+    for key, path in FILES.items():
+        install(path, base64.b64decode(bundle[key]))
+    install(STATE, etag.encode())
+
     if ON_CHANGE:
         subprocess.run(ON_CHANGE, check=True)
 
@@ -225,14 +260,15 @@ if __name__ == "__main__":
 Store the credentials as `username:password` in the credentials file, not on
 a command line, where other users could see them in the process list.
 
-The path must be exactly `/secrets/{exposure}/{key}`. Extra segments,
-`.`/`..`, percent-encoding of any kind and trailing slashes are rejected with
-`404`. The router works on the raw path and never redirects.
+The path must be exactly `/secrets/{exposure}/{key}` or
+`/bundles/{exposure}`. Extra segments, `.`/`..`, percent-encoding of any kind
+and trailing slashes are rejected with `404`. The router works on the raw path
+and never redirects.
 
 ### Status codes
 
-Checks run in this order. The order is deliberate: it decides what a caller
-can learn about the configuration.
+Checks run in this order, the same for both routes. The order is deliberate:
+it decides what a caller can learn about the configuration.
 
 | Step | Condition                                                            | Status | `reason`                    |
 | ---- | -------------------------------------------------------------------- | ------ | --------------------------- |
@@ -247,21 +283,29 @@ can learn about the configuration.
 | 7    | Source Secret missing                                                | 503    | `source_secret_unavailable` |
 | 8    | Key listed in `includeKeys` but missing from the Secret              | 503    | `expected_key_missing`      |
 | 8    | Any other key the exposure does not serve                            | 404    | `key_not_found`             |
-| 9    | Value unchanged since the client's `If-None-Match`                   | 304    | `not_modified`              |
-| 9    | Value served                                                         | 200    | `served`                    |
+| 9    | Body unchanged since the client's `If-None-Match`                    | 304    | `not_modified`              |
+| 9    | Value or bundle served                                               | 200    | `served`                    |
+
+Steps 1 to 7 are identical on both routes, so a bundle request reveals
+nothing about the configuration that a single-key request does not. They
+differ only at step 8: a bundle names no key, so it never answers
+`key_not_found`, and a bundle whose exposure serves no keys at all is `200`
+with an empty object. `expected_key_missing` applies unchanged — a bundle is
+either whole or `503`.
 
 `includeKeys` and `excludeKeys` define which keys an exposure has. A key
 filtered out by them is simply a key the exposure does not have: it answers
-exactly like a key that never existed in the Secret, in every state.
+exactly like a key that never existed in the Secret, in every state, and it is
+absent from the bundle.
 
 What this means for callers:
 
 - **From outside an exposure's allow-list**, an existing exposure answers
   exactly like a name that does not exist: same status, headers and body.
   Exposure names cannot be probed from the outside.
-- **On the allow-list but without valid credentials**, every key answers
-  `401`, whether it is served, excluded or missing. Which keys exist is only
-  visible after authenticating.
+- **On the allow-list but without valid credentials**, every key and every
+  bundle answers `401`, whether the key is served, excluded or missing. Which
+  keys exist is only visible after authenticating.
 - **503 means the gateway is configured correctly but a Secret is not in the
   expected state.** A 404 never hides an operational problem, and a 503 never
   reveals anything to an unauthenticated caller outside the allow-list.
@@ -667,6 +711,22 @@ The image is based on `distroless/static` (no shell) and runs as UID 65532.
 It exposes ports 8080 and 8081 and contains no configuration. It uses the
 pod's ServiceAccount token to talk to the API server.
 
+To run the tests, build the image and push it to `registry.aslot.dk` in one
+step:
+
+```sh
+scripts/push-image.sh           # tag from `git describe`, e.g. v0.1.0 or e4f0e1b
+scripts/push-image.sh 0.1.0     # explicit tag
+```
+
+The script runs `go vet` and the tests, builds for `linux/amd64` with
+`--pull`, then asks for the registry username and password. The credentials
+are used through a temporary Docker configuration that is deleted afterwards,
+so they are never stored. It prints the image digest at the end; pin
+deployments to it. Uncommitted changes are marked by a `-dirty` suffix on the
+tag. Set `IMAGE`, `PLATFORM`, `REGISTRY_USERNAME` or `SKIP_TESTS=1` to
+override the defaults.
+
 ### Flags
 
 | Flag          | Default                           | Meaning                                                                                                                           |
@@ -702,10 +762,10 @@ begun.
   allow-list) or key names (anywhere). See [Status codes](#status-codes).
   The metrics do list exposure names, so protect the metrics port (see
   [Metrics and health](#metrics-and-health)).
-- The ETag is an HMAC-SHA256 of the value, keyed with the Secret's UID. A
-  plain hash would let anyone who sees response headers but not bodies (a
-  `curl -v` in a CI log, for example) test guesses for short values such as
-  passwords. The UID is identical on every replica, so polling still works,
+- The ETag is an HMAC-SHA256 of the bytes served — one value, or the canonical
+  bundle body — keyed with the Secret's UID. A plain hash would let anyone who
+  sees response headers but not bodies (a `curl -v` in a CI log, for example)
+  test guesses for short values such as passwords. The UID is identical on every replica, so polling still works,
   and unknown to anyone who cannot read the Secret.
 - HTTP servers use read, write, header and idle timeouts and a 32 KiB header
   limit.
@@ -715,7 +775,10 @@ begun.
 - **Not supported:** the PROXY protocol, TLS passthrough (with
   `allowedCidrs`), client certificates, and authentication methods other than
   Basic Auth.
-- **One key per request:** there is no bundle endpoint and no Secret listing.
+- **No Secret listing:** a client has to know the exposure name. Within an
+  exposure, `/bundles/{exposure}` returns every key it serves.
+- **Bundles cover one Secret:** keys from two different Secrets have no shared
+  version, so nothing can serve them as one consistent set.
 - **Static configuration:** changes require a restart.
 - **During an API outage** the last known state is served; see the sync
   metrics.

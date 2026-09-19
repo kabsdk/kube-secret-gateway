@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -601,6 +602,301 @@ func TestETagFunction(t *testing.T) {
 	}
 	if !strings.HasPrefix(tag, `"hmac-sha256:`) || !strings.HasSuffix(tag, `"`) {
 		t.Fatalf("ETag = %s, want a quoted hmac-sha256 tag", tag)
+	}
+}
+
+// decodeBundle parses a bundle response. json.Unmarshal base64-decodes into
+// []byte, which is exactly how the handler encodes the values.
+func decodeBundle(t *testing.T, rec *httptest.ResponseRecorder) map[string][]byte {
+	t.Helper()
+	var got map[string][]byte
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("bundle body %q: %v", rec.Body.String(), err)
+	}
+	return got
+}
+
+func TestBundleServesEveryExposedKey(t *testing.T) {
+	h := newHarness(t)
+	rec := h.do("/bundles/my-cert")
+	expectStatus(t, rec, http.StatusOK)
+
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("Content-Type = %q", ct)
+	}
+	for _, hdr := range []string{"Cache-Control", "X-Content-Type-Options", "ETag"} {
+		if rec.Header().Get(hdr) == "" {
+			t.Fatalf("%s missing from bundle response", hdr)
+		}
+	}
+	if got := rec.Header().Get("Content-Length"); got != fmt.Sprint(rec.Body.Len()) {
+		t.Fatalf("Content-Length = %q, body is %d bytes", got, rec.Body.Len())
+	}
+
+	want := map[string]string{"tls.crt": certPEM, "tls.key": keyPEM, "ca.crt": "CA"}
+	got := decodeBundle(t, rec)
+	if len(got) != len(want) {
+		t.Fatalf("bundle has %d keys, want %d", len(got), len(want))
+	}
+	for k, v := range want {
+		if string(got[k]) != v {
+			t.Fatalf("bundle[%q] = %q, want %q", k, got[k], v)
+		}
+	}
+
+	// Keys are sorted, so the body is canonical: the ETag depends only on the
+	// Secret and the filter, never on map iteration order.
+	if !strings.HasPrefix(rec.Body.String(), `{"ca.crt":"`) {
+		t.Fatalf("bundle body is not in sorted key order: %q", rec.Body.String())
+	}
+	for range 5 {
+		if again := h.do("/bundles/my-cert"); again.Body.String() != rec.Body.String() {
+			t.Fatal("bundle body is not byte-stable across requests")
+		}
+	}
+}
+
+func TestBundleRespectsKeyFilters(t *testing.T) {
+	h := newHarness(t)
+	// excludeKeys: the excluded key is simply not part of the exposure.
+	rec := h.do("/bundles/public-only")
+	expectStatus(t, rec, http.StatusOK)
+	got := decodeBundle(t, rec)
+	if _, ok := got["tls.key"]; ok {
+		t.Fatal("excluded key leaked into the bundle")
+	}
+	if strings.Contains(rec.Body.String(), base64.StdEncoding.EncodeToString([]byte(keyPEM))) {
+		t.Fatal("excluded value present in the bundle body")
+	}
+	if string(got["tls.crt"]) != certPEM || string(got["ca.crt"]) != "CA" {
+		t.Fatalf("bundle = %v", got)
+	}
+
+	// includeKeys: keys outside the list stay invisible even once they exist.
+	rv := h.api.Apply(matrixRef, map[string][]byte{
+		"tls.crt": []byte("MATRIX-CRT"), "tls.key": []byte("MATRIX-KEY"), "ca.crt": []byte("CA"),
+	})
+	h.waitVersion(matrixRef, rv)
+	got = decodeBundle(t, h.do("/bundles/matrix-prod"))
+	if len(got) != 2 || string(got["tls.crt"]) != "MATRIX-CRT" || string(got["tls.key"]) != "MATRIX-KEY" {
+		t.Fatalf("includeKeys bundle = %v", got)
+	}
+}
+
+// TestBundleETagCoversTheWholeSet is the reason the route exists: one
+// conditional request tells a client whether any key it installs has changed,
+// so it can never assemble a certificate and a key from two versions.
+func TestBundleETagCoversTheWholeSet(t *testing.T) {
+	h := newHarness(t)
+	first := h.do("/bundles/my-cert")
+	expectStatus(t, first, http.StatusOK)
+	etag := first.Header().Get("ETag")
+
+	for _, inm := range []string{etag, "W/" + etag, `"other", ` + etag, "*"} {
+		rec := h.do("/bundles/my-cert", withHeader("If-None-Match", inm))
+		expectStatus(t, rec, http.StatusNotModified)
+		if rec.Body.Len() != 0 {
+			t.Fatalf("304 with body %q", rec.Body.String())
+		}
+		if rec.Header().Get("ETag") != etag {
+			t.Fatalf("304 ETag = %q, want %q", rec.Header().Get("ETag"), etag)
+		}
+	}
+
+	// A change to any single key changes the tag of the whole bundle.
+	rv := h.api.Apply(certRef, map[string][]byte{
+		"tls.crt": []byte(certPEM), "tls.key": []byte("ROTATED-KEY"), "ca.crt": []byte("CA"),
+	})
+	h.waitVersion(certRef, rv)
+	rec := h.do("/bundles/my-cert", withHeader("If-None-Match", etag))
+	expectStatus(t, rec, http.StatusOK)
+	if rec.Header().Get("ETag") == etag {
+		t.Fatal("bundle ETag unchanged after one of its keys changed")
+	}
+	// And the set that comes back is internally consistent: one read of one
+	// incarnation of the Secret.
+	got := decodeBundle(t, rec)
+	if string(got["tls.crt"]) != certPEM || string(got["tls.key"]) != "ROTATED-KEY" {
+		t.Fatalf("bundle straddles versions: %v", got)
+	}
+
+	// Adding a key the exposure serves also changes the tag.
+	before := rec.Header().Get("ETag")
+	rv = h.api.Apply(certRef, map[string][]byte{
+		"tls.crt": []byte(certPEM), "tls.key": []byte("ROTATED-KEY"), "ca.crt": []byte("CA"), "extra": []byte("x"),
+	})
+	h.waitVersion(certRef, rv)
+	if after := h.do("/bundles/my-cert").Header().Get("ETag"); after == before {
+		t.Fatal("bundle ETag unchanged after a key was added")
+	}
+
+	// Recreating the Secret changes the UID, and so the tag, exactly once.
+	h.api.Delete(certRef)
+	h.waitAbsent(certRef)
+	rv = h.api.Apply(certRef, map[string][]byte{"tls.crt": []byte(certPEM)})
+	h.waitVersion(certRef, rv)
+	recreated := h.do("/bundles/my-cert")
+	expectStatus(t, recreated, http.StatusOK)
+	tag := recreated.Header().Get("ETag")
+	if tag == before {
+		t.Fatal("bundle ETag unchanged after the Secret was recreated")
+	}
+	expectStatus(t, h.do("/bundles/my-cert", withHeader("If-None-Match", tag)), http.StatusNotModified)
+
+	// The bundle tag is not the tag of any single value it contains.
+	if tag == h.etag(certRef, certPEM) {
+		t.Fatal("single-key and bundle ETags collide")
+	}
+}
+
+// TestBundleBodyIsCanonical pins the wire format. The client repository
+// asserts the same literal in its fake gateway (TestCanonicalBody in
+// internal/gwtest), and the two share no code, so this pair of assertions is
+// what keeps them agreed. Changing the serialisation changes the ETag of every
+// bundle and makes every client download once more, so it must be deliberate.
+func TestBundleBodyIsCanonical(t *testing.T) {
+	const canonicalBody = `{"ca.crt":"Q0E=","tls.crt":"WA=="}`
+
+	h := newHarness(t)
+	rv := h.api.Apply(certRef, map[string][]byte{"tls.crt": []byte("X"), "ca.crt": []byte("CA")})
+	h.waitVersion(certRef, rv)
+
+	rec := h.do("/bundles/my-cert")
+	expectStatus(t, rec, http.StatusOK)
+	if got := rec.Body.String(); got != canonicalBody {
+		t.Fatalf("bundle body = %s\nwant         %s", got, canonicalBody)
+	}
+	// The tag is the HMAC of exactly those bytes, keyed with the Secret UID.
+	if got, want := rec.Header().Get("ETag"), h.etag(certRef, canonicalBody); got != want {
+		t.Fatalf("ETag = %s, want the tag of the canonical body %s", got, want)
+	}
+}
+
+func TestBundleRequiredKeyMissing(t *testing.T) {
+	h := newHarness(t)
+	// includeKeys promises tls.key, so losing it is an operational failure
+	// for the bundle just as it is for the single key.
+	rv := h.api.Apply(matrixRef, map[string][]byte{"tls.crt": []byte("MATRIX-CRT")})
+	h.waitVersion(matrixRef, rv)
+	rec := h.do("/bundles/matrix-prod")
+	expectStatus(t, rec, http.StatusServiceUnavailable)
+	if strings.Contains(rec.Body.String(), "MATRIX") || strings.Contains(rec.Body.String(), "tls") {
+		t.Fatalf("503 body leaked: %q", rec.Body.String())
+	}
+	// A partial bundle is never served.
+	if strings.Contains(rec.Body.String(), base64.StdEncoding.EncodeToString([]byte("MATRIX-CRT"))) {
+		t.Fatal("bundle served the keys it did have")
+	}
+
+	rv = h.api.Apply(matrixRef, map[string][]byte{"tls.crt": []byte("MATRIX-CRT"), "tls.key": []byte("NEW")})
+	h.waitVersion(matrixRef, rv)
+	expectStatus(t, h.do("/bundles/matrix-prod"), http.StatusOK)
+}
+
+func TestBundleOfSecretWithNoExposedKeys(t *testing.T) {
+	h := newHarness(t)
+	rv := h.api.Apply(certRef, map[string][]byte{})
+	h.waitVersion(certRef, rv)
+	rec := h.do("/bundles/my-cert")
+	expectStatus(t, rec, http.StatusOK)
+	if rec.Body.String() != "{}" {
+		t.Fatalf("empty bundle = %q, want {}", rec.Body.String())
+	}
+}
+
+func TestBundleAccessControlMatchesSingleKeys(t *testing.T) {
+	h := newHarness(t)
+	for _, tc := range []struct {
+		what string
+		opts []reqOption
+		want int
+	}{
+		{"outside the allow-list", []reqOption{from("192.0.2.1:1")}, http.StatusNotFound},
+		{"without credentials", []reqOption{withoutAuth()}, http.StatusUnauthorized},
+		{"wrong password", []reqOption{withAuth(username, "nope")}, http.StatusUnauthorized},
+	} {
+		t.Run(tc.what, func(t *testing.T) {
+			rec := h.do("/bundles/my-cert", tc.opts...)
+			expectStatus(t, rec, tc.want)
+			if strings.Contains(rec.Body.String(), "tls") || strings.Contains(rec.Body.String(), "PRIVATE") {
+				t.Fatalf("body leaked: %q", rec.Body.String())
+			}
+		})
+	}
+
+	// An unknown exposure is a 404 on this route too, so bundles cannot be
+	// used to probe for names.
+	expectStatus(t, h.do("/bundles/no-such-exposure"), http.StatusNotFound)
+	// From outside the allow-list, a real exposure and an invented one are
+	// indistinguishable.
+	known := h.do("/bundles/my-cert", from("192.0.2.1:1"))
+	fake := h.do("/bundles/no-such-exposure", from("192.0.2.1:1"))
+	if known.Code != fake.Code || known.Body.String() != fake.Body.String() {
+		t.Fatal("bundle route distinguishes a configured exposure from an unknown one")
+	}
+
+	// A Secret that has never existed is 503, as for a single key.
+	expectStatus(t, h.do("/bundles/pending"), http.StatusServiceUnavailable)
+
+	// Deleted while running.
+	h.api.Delete(certRef)
+	h.waitAbsent(certRef)
+	expectStatus(t, h.do("/bundles/my-cert"), http.StatusServiceUnavailable)
+}
+
+func TestBundleMethods(t *testing.T) {
+	h := newHarness(t)
+	for _, m := range []string{http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch, http.MethodOptions} {
+		rec := h.do("/bundles/my-cert", withMethod(m))
+		expectStatus(t, rec, http.StatusMethodNotAllowed)
+		if rec.Header().Get("Allow") != "GET, HEAD" {
+			t.Fatalf("Allow = %q", rec.Header().Get("Allow"))
+		}
+	}
+	full := h.do("/bundles/my-cert")
+	rec := h.do("/bundles/my-cert", withMethod(http.MethodHead))
+	expectStatus(t, rec, http.StatusOK)
+	if rec.Body.Len() != 0 {
+		t.Fatal("HEAD must send headers only")
+	}
+	if rec.Header().Get("Content-Length") != fmt.Sprint(full.Body.Len()) {
+		t.Fatalf("HEAD Content-Length = %q, want %d", rec.Header().Get("Content-Length"), full.Body.Len())
+	}
+	if rec.Header().Get("ETag") != full.Header().Get("ETag") {
+		t.Fatal("HEAD and GET disagree about the ETag")
+	}
+}
+
+func TestMalformedBundlePathsRejected(t *testing.T) {
+	h := newHarness(t)
+	h.source.reset()
+	paths := []string{
+		"/bundles",
+		"/bundles/",
+		"/bundles/my-cert/",
+		"/bundles/my-cert/tls.crt",
+		"/bundles/my-cert/..",
+		"/bundles/../secrets/my-cert/tls.crt",
+		"/bundles/%2e%2e",
+		"/bundles/my%2dcert",
+		"/bundles/MY-CERT",
+		"/bundles//my-cert",
+		"//bundles/my-cert",
+		"/BUNDLES/my-cert",
+		"/v1/bundles/my-cert",
+		"/bundles/" + strings.Repeat("a", 254),
+	}
+	for _, p := range paths {
+		t.Run(p, func(t *testing.T) {
+			rec := h.do(p)
+			expectStatus(t, rec, http.StatusNotFound)
+			if loc := rec.Header().Get("Location"); loc != "" {
+				t.Fatalf("redirected to %q", loc)
+			}
+		})
+	}
+	if refs := h.source.lookups(); len(refs) != 0 {
+		t.Fatalf("malformed bundle paths caused lookups: %v", refs)
 	}
 }
 
