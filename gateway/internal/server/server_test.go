@@ -749,9 +749,10 @@ func TestBundleETagCoversTheWholeSet(t *testing.T) {
 	}
 }
 
-// TestBundleBodyIsCanonical pins the wire format. The client repository
-// asserts the same literal in its fake gateway (TestCanonicalBody in
-// internal/gwtest), and the two share no code, so this pair of assertions is
+// TestBundleBodyIsCanonical pins the wire format. The client asserts the same
+// literal in its fake gateway (TestCanonicalBody in
+// ../../../agent/internal/gwtest). The gateway and the agent
+// are separate Go modules that share no code, so this pair of assertions is
 // what keeps them agreed. Changing the serialisation changes the ETag of every
 // bundle and makes every client download once more, so it must be deliberate.
 func TestBundleBodyIsCanonical(t *testing.T) {
@@ -1016,16 +1017,16 @@ func TestMetricsEndpointAndRequestCounters(t *testing.T) {
 	expectStatus(t, rec, http.StatusOK)
 	body := rec.Body.String()
 	for _, want := range []string{
-		`kube_secret_gateway_http_requests_total{export="my-cert",reason="served",status="200"} 1`,
-		`kube_secret_gateway_http_requests_total{export="my-cert",reason="not_modified",status="304"} 1`,
-		`kube_secret_gateway_http_requests_total{export="my-cert",reason="unauthorized",status="401"} 1`,
-		`kube_secret_gateway_http_requests_total{export="my-cert",reason="client_not_allowed",status="404"} 1`,
-		`kube_secret_gateway_http_requests_total{export="my-cert",reason="key_not_found",status="404"} 50`,
-		`kube_secret_gateway_http_requests_total{export="pending",reason="source_secret_unavailable",status="503"} 1`,
-		`kube_secret_gateway_http_requests_total{export="public-only",reason="key_not_found",status="404"} 1`,
-		`kube_secret_gateway_http_requests_total{export="_unknown",reason="unknown_exposure",status="404"} 50`,
-		`kube_secret_gateway_http_requests_total{export="_unknown",reason="no_route",status="404"} 50`,
-		`kube_secret_gateway_source_secret_present{export="pending",namespace="certificates",secret="not-created-yet"} 0`,
+		`kube_secret_gateway_http_requests_total{exposure="my-cert",reason="served",status="200"} 1`,
+		`kube_secret_gateway_http_requests_total{exposure="my-cert",reason="not_modified",status="304"} 1`,
+		`kube_secret_gateway_http_requests_total{exposure="my-cert",reason="unauthorized",status="401"} 1`,
+		`kube_secret_gateway_http_requests_total{exposure="my-cert",reason="client_not_allowed",status="404"} 1`,
+		`kube_secret_gateway_http_requests_total{exposure="my-cert",reason="key_not_found",status="404"} 50`,
+		`kube_secret_gateway_http_requests_total{exposure="pending",reason="source_secret_unavailable",status="503"} 1`,
+		`kube_secret_gateway_http_requests_total{exposure="public-only",reason="key_not_found",status="404"} 1`,
+		`kube_secret_gateway_http_requests_total{exposure="_unknown",reason="unknown_exposure",status="404"} 50`,
+		`kube_secret_gateway_http_requests_total{exposure="_unknown",reason="no_route",status="404"} 50`,
+		`kube_secret_gateway_source_secret_present{exposure="pending",namespace="certificates",secret="not-created-yet"} 0`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("metrics lack %q", want)
@@ -1068,7 +1069,7 @@ func TestLogsNeverContainSecretsOrCredentials(t *testing.T) {
 	h.do("/secrets/my-cert/tls.crt", withAuth(username, "rotated-secret-password"))
 
 	logs := h.logs.String()
-	if !strings.Contains(logs, `"export":"my-cert"`) || !strings.Contains(logs, `"client_ip":"10.10.30.40"`) {
+	if !strings.Contains(logs, `"exposure":"my-cert"`) || !strings.Contains(logs, `"client_ip":"10.10.30.40"`) {
 		t.Fatalf("expected request logs, got:\n%s", logs)
 	}
 	forbidden := []string{

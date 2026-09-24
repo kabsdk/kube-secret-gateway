@@ -11,8 +11,8 @@
 //	GET /readyz                     readiness
 //	GET /metrics                    Prometheus metrics, optionally authenticated
 //
-// Keeping them apart means only /secrets/ needs to be reachable through the
-// ingress, and nothing on that port reveals which exposures exist.
+// Keeping them apart means only /secrets/ and /bundles/ need to be reachable
+// through the ingress, and nothing on that port reveals which exposures exist.
 //
 // The bundle route exists so that a client can install several keys that
 // belong together, such as a certificate and its private key, without ever
@@ -75,11 +75,11 @@ type SecretSource interface {
 	Secret(ref exposure.SecretRef) resources.Secret
 }
 
-// RequestObserver records the outcome of Secret endpoint requests. export is
+// RequestObserver records the outcome of Secret endpoint requests. name is
 // empty for requests that did not resolve to a configured exposure; reason is
 // always one of the Reason constants.
 type RequestObserver interface {
-	ObserveRequest(export string, status int, reason string)
+	ObserveRequest(name string, status int, reason string)
 }
 
 // Reasons explain a response in logs and metrics. Several map to the same
@@ -165,7 +165,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // outcome collects what is logged and counted for one request. It never
 // holds credentials or Secret data.
 type outcome struct {
-	export string // configured exposure name; empty if none matched
+	name   string // configured exposure name; empty if none matched
 	key    string // requested key, or the missing required key of a bundle
 	bundle bool   // the request was for /bundles/{exposure}
 	client netip.Addr
@@ -245,7 +245,7 @@ func (h *Handler) handleRequest(w http.ResponseWriter, r *http.Request, o *outco
 		fail(http.StatusNotFound, ReasonUnknownExposure)
 		return
 	}
-	o.export, o.key, o.bundle = exp.Name, rt.key, rt.bundle
+	o.name, o.key, o.bundle = exp.Name, rt.key, rt.bundle
 	if ipErr != nil {
 		fail(http.StatusNotFound, ReasonClientAddressUnresolved)
 		return
@@ -443,11 +443,11 @@ func writeError(w http.ResponseWriter, status int) {
 }
 
 func (h *Handler) finish(r *http.Request, o *outcome, elapsed time.Duration) {
-	h.observer.ObserveRequest(o.export, o.status, o.reason)
+	h.observer.ObserveRequest(o.name, o.status, o.reason)
 
 	attrs := make([]slog.Attr, 0, 9)
-	if o.export != "" {
-		attrs = append(attrs, slog.String("export", o.export))
+	if o.name != "" {
+		attrs = append(attrs, slog.String("exposure", o.name))
 		if o.bundle {
 			attrs = append(attrs, slog.Bool("bundle", true))
 		}

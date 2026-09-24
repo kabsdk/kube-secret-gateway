@@ -168,8 +168,8 @@ secrets:
 		t.Fatalf("scrape = %d", code)
 	}
 	wantMetrics := []string{
-		`kube_secret_gateway_source_secret_present{export="my-cert",namespace="certificates",secret="my-cert"} 0`,
-		`kube_secret_gateway_source_secret_present{export="later",namespace="certificates",secret="created-later"} 1`,
+		`kube_secret_gateway_source_secret_present{exposure="my-cert",namespace="certificates",secret="my-cert"} 0`,
+		`kube_secret_gateway_source_secret_present{exposure="later",namespace="certificates",secret="created-later"} 1`,
 		`kube_secret_gateway_watch_connected{namespace="certificate-auth",secret="fetcher"} 1`,
 	}
 	if secure {

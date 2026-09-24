@@ -11,13 +11,18 @@
 # nothing is written to ~/.docker/config.json or a credential store.
 #
 # Environment:
-#   IMAGE              repository (default: registry.aslot.dk/kube-secret-gateway)
+#   IMAGE              image repository to push (required)
 #   PLATFORM           target platform (default: linux/amd64)
 #   REGISTRY_USERNAME  default for the username prompt
 #   SKIP_TESTS=1       skip go vet and go test
 set -euo pipefail
 
-image=${IMAGE:-registry.aslot.dk/kube-secret-gateway}
+: "${IMAGE:?set IMAGE to the image repository, for example registry.example.com/kube-secret-gateway}"
+image=$IMAGE
+if [[ $image != */* ]]; then
+  echo "error: IMAGE must include a registry, for example registry.example.com/kube-secret-gateway" >&2
+  exit 2
+fi
 registry=${image%%/*}
 platform=${PLATFORM:-linux/amd64}
 

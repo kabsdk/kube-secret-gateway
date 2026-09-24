@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-ARG GO_VERSION=1.27
+ARG GO_VERSION=1.26
 
 # Build on the native platform and cross-compile, so multi-arch builds do not
 # run the Go toolchain under emulation.

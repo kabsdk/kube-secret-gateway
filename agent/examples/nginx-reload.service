@@ -1,0 +1,6 @@
+[Unit]
+Description=Reload nginx
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl reload nginx

@@ -2,12 +2,15 @@ package config
 
 import (
 	"errors"
+	"io"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"go.yaml.in/yaml/v3"
 
 	"kube-secret-gateway/internal/exposure"
 )
@@ -108,6 +111,45 @@ func TestParseSpecExample(t *testing.T) {
 	if second.Keys.Exposes("ca.crt") {
 		t.Error("second exposure: key outside includeKeys is exposed")
 	}
+}
+
+func TestShippedExampleIsValid(t *testing.T) {
+	if _, err := Load(filepath.Join("..", "..", "examples", "config.yaml")); err != nil {
+		t.Fatalf("Load shipped example: %v", err)
+	}
+
+	f, err := os.Open(filepath.Join("..", "..", "examples", "kubernetes.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	dec := yaml.NewDecoder(f)
+	for {
+		var resource struct {
+			Kind string            `yaml:"kind"`
+			Data map[string]string `yaml:"data"`
+		}
+		err := dec.Decode(&resource)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("decode kubernetes.yaml: %v", err)
+		}
+		if resource.Kind != "ConfigMap" {
+			continue
+		}
+		data, ok := resource.Data["config.yaml"]
+		if !ok {
+			t.Fatal("ConfigMap in kubernetes.yaml has no config.yaml")
+		}
+		if _, err := Parse([]byte(data)); err != nil {
+			t.Fatalf("parse ConfigMap config.yaml: %v", err)
+		}
+		return
+	}
+	t.Fatal("kubernetes.yaml has no ConfigMap")
 }
 
 // minimal renders one exposure with overridable fragments.

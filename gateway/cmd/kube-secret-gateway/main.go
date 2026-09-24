@@ -280,7 +280,7 @@ func logStartup(logger *slog.Logger, path string, cfg *config.Config, secretsTLS
 		"trusted_proxies", len(cfg.Server.TrustedProxies))
 	for i := range cfg.Exposures {
 		e := &cfg.Exposures[i]
-		logger.Info("exposure configured", "export", e.Name,
+		logger.Info("exposure configured", "exposure", e.Name,
 			"namespace", e.Source.Namespace, "secret", e.Source.Name,
 			"auth_type", string(e.Auth.Type), "auth_namespace", e.Auth.SecretRef.Namespace, "auth_secret", e.Auth.SecretRef.Name,
 			"allowed_cidrs", len(e.AllowedCIDRs), "required_keys", e.Keys.RequiredKeys())

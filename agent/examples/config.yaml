@@ -1,0 +1,24 @@
+# /etc/kube-secret-gateway-agent/config.yaml
+gateway:
+  url: https://gateway.example.com
+  # caFile replaces the system trust store for this connection, rather than
+  # adding to it. Use it when the gateway has a private CA.
+  caFile: /etc/ssl/certs/internal-ca.crt
+  timeout: 30s
+
+# Credentials are read again before every fetch, so rotating this file needs
+# no agent restart.
+exposures:
+  - name: my-cert
+    username: fetcher
+    passwordFile: /etc/kube-secret-gateway-agent/my-cert.password
+
+bundles:
+  # The certificate and key are fetched together from one Secret version.
+  - name: nginx-tls
+    exposure: my-cert
+    interval: 24h
+    onChangeCommand: [systemctl, reload, nginx]
+    files:
+      tls.crt: { path: /etc/ssl/nginx/tls.crt, mode: "0644" }
+      tls.key: /etc/ssl/nginx/tls.key

@@ -135,8 +135,8 @@ func expectValue(t *testing.T, f *fixture, name string, labels map[string]string
 	}
 }
 
-func exportLabels(export string, ref exposure.SecretRef) map[string]string {
-	return map[string]string{"export": export, "namespace": ref.Namespace, "secret": ref.Name}
+func exposureLabels(name string, ref exposure.SecretRef) map[string]string {
+	return map[string]string{"exposure": name, "namespace": ref.Namespace, "secret": ref.Name}
 }
 
 func refLabels(ref exposure.SecretRef) map[string]string {
@@ -146,23 +146,23 @@ func refLabels(ref exposure.SecretRef) map[string]string {
 func TestSourceSecretPresenceTransitions(t *testing.T) {
 	f := newFixture(t, seedAll)
 	const name = "kube_secret_gateway_source_secret_present"
-	labels := exportLabels("my-cert", certRef)
+	labels := exposureLabels("my-cert", certRef)
 
 	expectValue(t, f, name, labels, 1)
 	f.api.Delete(certRef)
 	expectValue(t, f, name, labels, 0)
-	expectValue(t, f, name, exportLabels("my-cert-public", certRef), 0)
-	expectValue(t, f, "kube_secret_gateway_export_healthy", map[string]string{"export": "my-cert"}, 0)
+	expectValue(t, f, name, exposureLabels("my-cert-public", certRef), 0)
+	expectValue(t, f, "kube_secret_gateway_exposure_healthy", map[string]string{"exposure": "my-cert"}, 0)
 	f.api.Apply(certRef, map[string][]byte{"tls.crt": []byte("C2")})
 	expectValue(t, f, name, labels, 1)
-	expectValue(t, f, "kube_secret_gateway_export_healthy", map[string]string{"export": "my-cert"}, 1)
+	expectValue(t, f, "kube_secret_gateway_exposure_healthy", map[string]string{"exposure": "my-cert"}, 1)
 }
 
 func TestMissingAtStartupIsReportedWithoutRequests(t *testing.T) {
 	f := newFixture(t, nil)
-	expectValue(t, f, "kube_secret_gateway_source_secret_present", exportLabels("my-cert", certRef), 0)
-	expectValue(t, f, "kube_secret_gateway_auth_secret_present", exportLabels("my-cert", authRef), 0)
-	expectValue(t, f, "kube_secret_gateway_export_healthy", map[string]string{"export": "matrix-prod"}, 0)
+	expectValue(t, f, "kube_secret_gateway_source_secret_present", exposureLabels("my-cert", certRef), 0)
+	expectValue(t, f, "kube_secret_gateway_auth_secret_present", exposureLabels("my-cert", authRef), 0)
+	expectValue(t, f, "kube_secret_gateway_exposure_healthy", map[string]string{"exposure": "matrix-prod"}, 0)
 }
 
 func TestAuthSecretPresenceAndValidity(t *testing.T) {
@@ -170,7 +170,7 @@ func TestAuthSecretPresenceAndValidity(t *testing.T) {
 		api.Apply(certRef, map[string][]byte{"tls.crt": []byte("C")})
 	})
 	present, valid := "kube_secret_gateway_auth_secret_present", "kube_secret_gateway_auth_secret_valid"
-	labels := exportLabels("my-cert", authRef)
+	labels := exposureLabels("my-cert", authRef)
 
 	expectValue(t, f, present, labels, 0)
 	expectValue(t, f, valid, labels, 0)
@@ -178,14 +178,14 @@ func TestAuthSecretPresenceAndValidity(t *testing.T) {
 	f.api.Apply(authRef, map[string][]byte{"username": []byte("u")}) // password missing
 	expectValue(t, f, present, labels, 1)
 	expectValue(t, f, valid, labels, 0)
-	expectValue(t, f, "kube_secret_gateway_export_healthy", map[string]string{"export": "my-cert"}, 0)
+	expectValue(t, f, "kube_secret_gateway_exposure_healthy", map[string]string{"exposure": "my-cert"}, 0)
 
 	f.api.Apply(authRef, map[string][]byte{"password": []byte("p")}) // username missing
 	expectValue(t, f, valid, labels, 0)
 
 	f.api.Apply(authRef, map[string][]byte{"username": []byte("u"), "password": []byte("p")})
 	expectValue(t, f, valid, labels, 1)
-	expectValue(t, f, "kube_secret_gateway_export_healthy", map[string]string{"export": "my-cert"}, 1)
+	expectValue(t, f, "kube_secret_gateway_exposure_healthy", map[string]string{"exposure": "my-cert"}, 1)
 
 	f.api.Delete(authRef)
 	expectValue(t, f, present, labels, 0)
@@ -198,28 +198,28 @@ func TestAuthSecretPresenceAndValidity(t *testing.T) {
 func TestExpectedKeyPresence(t *testing.T) {
 	f := newFixture(t, seedAll)
 	const name = "kube_secret_gateway_expected_key_present"
-	crt := map[string]string{"export": "matrix-prod", "key": "tls.crt"}
-	key := map[string]string{"export": "matrix-prod", "key": "tls.key"}
-	healthy := map[string]string{"export": "matrix-prod"}
+	crt := map[string]string{"exposure": "matrix-prod", "key": "tls.crt"}
+	key := map[string]string{"exposure": "matrix-prod", "key": "tls.key"}
+	healthy := map[string]string{"exposure": "matrix-prod"}
 
 	expectValue(t, f, name, crt, 1)
 	expectValue(t, f, name, key, 1)
-	expectValue(t, f, "kube_secret_gateway_export_healthy", healthy, 1)
+	expectValue(t, f, "kube_secret_gateway_exposure_healthy", healthy, 1)
 
 	f.api.Apply(matrixRef, map[string][]byte{"tls.crt": []byte("C")})
 	expectValue(t, f, name, key, 0)
 	expectValue(t, f, name, crt, 1)
-	expectValue(t, f, "kube_secret_gateway_export_healthy", healthy, 0)
+	expectValue(t, f, "kube_secret_gateway_exposure_healthy", healthy, 0)
 
 	f.api.Delete(matrixRef)
 	expectValue(t, f, name, crt, 0)
 
 	f.api.Apply(matrixRef, map[string][]byte{"tls.crt": []byte("C"), "tls.key": []byte("K")})
 	expectValue(t, f, name, key, 1)
-	expectValue(t, f, "kube_secret_gateway_export_healthy", healthy, 1)
+	expectValue(t, f, "kube_secret_gateway_exposure_healthy", healthy, 1)
 
 	// Only includeKeys produce expected-key series.
-	if _, ok := value(t, f.reg, name, map[string]string{"export": "my-cert", "key": "tls.crt"}); ok {
+	if _, ok := value(t, f.reg, name, map[string]string{"exposure": "my-cert", "key": "tls.crt"}); ok {
 		t.Fatal("expected_key_present emitted for an exposure without includeKeys")
 	}
 }
@@ -302,11 +302,11 @@ func TestRequestLabelsAreBounded(t *testing.T) {
 	f.m.ObserveRequest("my-cert", 99999, "internal_error")
 
 	counter := "kube_secret_gateway_http_requests_total"
-	expectValue(t, f, counter, map[string]string{"export": "my-cert", "status": "200", "reason": "served"}, 2)
-	expectValue(t, f, counter, map[string]string{"export": "my-cert", "status": "404", "reason": "client_not_allowed"}, 1)
-	expectValue(t, f, counter, map[string]string{"export": metrics.UnknownExport, "status": "404", "reason": "no_route"}, 1)
-	expectValue(t, f, counter, map[string]string{"export": metrics.UnknownExport, "status": "404", "reason": "unknown_exposure"}, 200)
-	expectValue(t, f, counter, map[string]string{"export": "my-cert", "status": "other", "reason": "internal_error"}, 1)
+	expectValue(t, f, counter, map[string]string{"exposure": "my-cert", "status": "200", "reason": "served"}, 2)
+	expectValue(t, f, counter, map[string]string{"exposure": "my-cert", "status": "404", "reason": "client_not_allowed"}, 1)
+	expectValue(t, f, counter, map[string]string{"exposure": metrics.UnknownExposure, "status": "404", "reason": "no_route"}, 1)
+	expectValue(t, f, counter, map[string]string{"exposure": metrics.UnknownExposure, "status": "404", "reason": "unknown_exposure"}, 200)
+	expectValue(t, f, counter, map[string]string{"exposure": "my-cert", "status": "other", "reason": "internal_error"}, 1)
 	if n := seriesCount(t, f.reg, counter); n != 5 {
 		t.Fatalf("got %d request series, want 5", n)
 	}
@@ -347,9 +347,9 @@ func TestHandlerServesExposition(t *testing.T) {
 	f.m.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	body := rec.Body.String()
 	for _, want := range []string{
-		`kube_secret_gateway_source_secret_present{export="my-cert",namespace="certificates",secret="my-cert"} 1`,
-		`kube_secret_gateway_auth_secret_present{export="my-cert",namespace="certificate-auth",secret="my-cert-fetcher-credentials"} 1`,
-		`kube_secret_gateway_expected_key_present{export="matrix-prod",key="tls.crt"} 1`,
+		`kube_secret_gateway_source_secret_present{exposure="my-cert",namespace="certificates",secret="my-cert"} 1`,
+		`kube_secret_gateway_auth_secret_present{exposure="my-cert",namespace="certificate-auth",secret="my-cert-fetcher-credentials"} 1`,
+		`kube_secret_gateway_expected_key_present{exposure="matrix-prod",key="tls.crt"} 1`,
 		`kube_secret_gateway_watch_connected{namespace="certificates",secret="my-cert"} 1`,
 		`kube_secret_gateway_watch_errors_total{namespace="certificates",secret="my-cert"} 0`,
 		`kube_secret_gateway_last_successful_sync_timestamp_seconds{namespace="certificates",secret="my-cert"}`,

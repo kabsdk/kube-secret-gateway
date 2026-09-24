@@ -25,10 +25,10 @@ import (
 
 const prefix = "kube_secret_gateway_"
 
-// UnknownExport is the export label of requests that do not resolve to a
+// UnknownExposure is the exposure label of requests that do not resolve to a
 // configured exposure. It cannot collide with an exposure name because those
 // are RFC 1123 subdomains, which cannot contain '_'.
-const UnknownExport = "_unknown"
+const UnknownExposure = "_unknown"
 
 // State is the read-only view of the resource cache the metrics need.
 type State interface {
@@ -40,7 +40,7 @@ type State interface {
 type Metrics struct {
 	registry *prometheus.Registry
 	requests *prometheus.CounterVec
-	exports  map[string]struct{}
+	names    map[string]struct{}
 }
 
 // New registers all collectors on a dedicated registry.
@@ -49,12 +49,12 @@ func New(exposures []exposure.Exposure, state State) (*Metrics, error) {
 		registry: prometheus.NewRegistry(),
 		requests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: prefix + "http_requests_total",
-			Help: `HTTP requests to Secret endpoints by exposure, status code and reason. Requests not matching a configured exposure are counted as export="` + UnknownExport + `". The reason distinguishes outcomes that clients deliberately see as the same status, such as an unknown exposure and a client outside allowedCidrs (both 404).`,
-		}, []string{"export", "status", "reason"}),
-		exports: make(map[string]struct{}, len(exposures)),
+			Help: `HTTP requests to Secret endpoints by exposure, status code and reason. Requests not matching a configured exposure are counted as exposure="` + UnknownExposure + `". The reason distinguishes outcomes that clients deliberately see as the same status, such as an unknown exposure and a client outside allowedCidrs (both 404).`,
+		}, []string{"exposure", "status", "reason"}),
+		names: make(map[string]struct{}, len(exposures)),
 	}
 	for i := range exposures {
-		m.exports[exposures[i].Name] = struct{}{}
+		m.names[exposures[i].Name] = struct{}{}
 	}
 	err := errors.Join(
 		m.registry.Register(collectors.NewGoCollector()),
@@ -68,19 +68,19 @@ func New(exposures []exposure.Exposure, state State) (*Metrics, error) {
 	return m, nil
 }
 
-// ObserveRequest counts one Secret endpoint request. Export names that are
-// not configured are folded into UnknownExport, so arbitrary request paths
+// ObserveRequest counts one Secret endpoint request. Exposure names that are
+// not configured are folded into UnknownExposure, so arbitrary request paths
 // cannot create series. The reason must come from a fixed set of constants,
 // never from request data.
-func (m *Metrics) ObserveRequest(export string, status int, reason string) {
-	if _, ok := m.exports[export]; !ok {
-		export = UnknownExport
+func (m *Metrics) ObserveRequest(name string, status int, reason string) {
+	if _, ok := m.names[name]; !ok {
+		name = UnknownExposure
 	}
 	code := "other"
 	if status >= 100 && status <= 599 {
 		code = strconv.Itoa(status)
 	}
-	m.requests.WithLabelValues(export, code, reason).Inc()
+	m.requests.WithLabelValues(name, code, reason).Inc()
 }
 
 // Handler serves the registry in the Prometheus exposition format.
@@ -92,24 +92,24 @@ func (m *Metrics) Handler() http.Handler {
 func (m *Metrics) Registry() *prometheus.Registry { return m.registry }
 
 var (
-	exportRefLabels = []string{"export", "namespace", "secret"}
-	resourceLabels  = []string{"namespace", "secret"}
+	exposureRefLabels = []string{"exposure", "namespace", "secret"}
+	resourceLabels    = []string{"namespace", "secret"}
 
 	sourcePresentDesc = prometheus.NewDesc(prefix+"source_secret_present",
 		"Whether the exposure's source Secret currently exists (1), or is absent or not yet synchronized (0).",
-		exportRefLabels, nil)
+		exposureRefLabels, nil)
 	authPresentDesc = prometheus.NewDesc(prefix+"auth_secret_present",
 		"Whether the exposure's authentication Secret currently exists.",
-		exportRefLabels, nil)
+		exposureRefLabels, nil)
 	authValidDesc = prometheus.NewDesc(prefix+"auth_secret_valid",
 		"Whether the exposure's authentication Secret exists and contains usable credentials (non-empty username and password).",
-		exportRefLabels, nil)
+		exposureRefLabels, nil)
 	expectedKeyDesc = prometheus.NewDesc(prefix+"expected_key_present",
 		"Whether a key listed in the exposure's includeKeys is present in its source Secret.",
-		[]string{"export", "key"}, nil)
-	exportHealthyDesc = prometheus.NewDesc(prefix+"export_healthy",
+		[]string{"exposure", "key"}, nil)
+	exposureHealthyDesc = prometheus.NewDesc(prefix+"exposure_healthy",
 		"Whether the exposure can serve requests: source Secret present, authentication Secret valid and every includeKeys entry present.",
-		[]string{"export"}, nil)
+		[]string{"exposure"}, nil)
 	watchConnectedDesc = prometheus.NewDesc(prefix+"watch_connected",
 		"Whether a watch on the Secret is currently established.",
 		resourceLabels, nil)
@@ -132,7 +132,7 @@ type stateCollector struct {
 
 func (c *stateCollector) Describe(ch chan<- *prometheus.Desc) {
 	for _, d := range []*prometheus.Desc{
-		sourcePresentDesc, authPresentDesc, authValidDesc, expectedKeyDesc, exportHealthyDesc,
+		sourcePresentDesc, authPresentDesc, authValidDesc, expectedKeyDesc, exposureHealthyDesc,
 		watchConnectedDesc, lastSyncDesc, watchErrorsDesc, syncErrorsDesc,
 	} {
 		ch <- d
@@ -174,7 +174,7 @@ func (c *stateCollector) Collect(ch chan<- prometheus.Metric) {
 			healthy = healthy && present
 			ch <- prometheus.MustNewConstMetric(expectedKeyDesc, prometheus.GaugeValue, boolValue(present), e.Name, key)
 		}
-		ch <- prometheus.MustNewConstMetric(exportHealthyDesc, prometheus.GaugeValue, boolValue(healthy), e.Name)
+		ch <- prometheus.MustNewConstMetric(exposureHealthyDesc, prometheus.GaugeValue, boolValue(healthy), e.Name)
 	}
 }
 

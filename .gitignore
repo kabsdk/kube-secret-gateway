@@ -1,1 +1,4 @@
-.history
+/dist/
+/agent/dist/
+/gateway/dist/
+/.history/
