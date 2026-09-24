@@ -54,5 +54,5 @@ for platform in $platforms; do
 done
 
 echo "==> SHA256SUMS"
-(cd "$out_dir" && sha256sum ./* > SHA256SUMS && cat SHA256SUMS)
+(cd "$out_dir" && sha256sum kube-secret-gateway-agent-* > SHA256SUMS && cat SHA256SUMS)
 echo "==> done: $out_dir"

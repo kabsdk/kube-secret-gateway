@@ -144,7 +144,9 @@ Kubernetes example with:
 - readiness and liveness probes;
 - an inline ConfigMap containing the gateway configuration.
 
-Before applying it, replace the example image and client CIDR in the manifest:
+Before applying it, choose a published image version and replace the example
+client CIDR in the manifest. Production deployments should pin the image by
+digest.
 
 ```sh
 kubectl apply -f gateway/examples/kubernetes.yaml

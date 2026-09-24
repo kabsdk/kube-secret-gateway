@@ -50,9 +50,19 @@ tests build and exercise the real agent.
 - Consult the [gateway reference](gateway/REFERENCE.md) for the complete HTTP
   contract, proxy behavior, TLS, metrics, and security details.
 
+Versioned releases publish the gateway image at
+`ghcr.io/kabsdk/kube-secret-gateway` and attach host-agent binaries and
+checksums to the corresponding
+[GitHub Release](https://github.com/kabsdk/kube-secret-gateway/releases).
+Maintainers can find the version policy and release procedure in
+[RELEASING.md](RELEASING.md).
+
 The gateway is a distribution service, not a general secret manager. It does
 not create or modify Secrets, and a value already delivered to a client cannot
 be remotely revoked.
+
+Kube Secret Gateway is licensed under the
+[Apache License 2.0](LICENSE).
 
 ## Development
 

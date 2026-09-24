@@ -51,14 +51,23 @@ The agent is a static binary intended to run on the destination host under
 systemd. Running it on the host lets it write directly to the required paths
 and run commands such as `systemctl reload nginx`.
 
-From the `agent/` directory, build and install it:
+Download the binary for a published version, verify it against the release
+checksums, and install it. For example, on a Linux AMD64 host:
 
 ```sh
-CGO_ENABLED=0 go build -trimpath \
-  -ldflags="-s -w -X main.version=$(git describe --tags --always)" \
-  -o kube-secret-gateway-agent ./cmd/kube-secret-gateway-agent
-sudo install -m 0755 kube-secret-gateway-agent /usr/local/bin/
+version=v0.1.0
+asset="kube-secret-gateway-agent-${version}-linux-amd64"
+base="https://github.com/kabsdk/kube-secret-gateway/releases/download/${version}"
+
+curl --fail --location --remote-name "${base}/${asset}"
+curl --fail --location --remote-name "${base}/SHA256SUMS"
+grep " ${asset}$" SHA256SUMS | sha256sum --check
+sudo install -m 0755 "$asset" /usr/local/bin/kube-secret-gateway-agent
 ```
+
+ARM64 hosts use the otherwise identical `linux-arm64` asset. Releases and
+their checksums are available on the
+[GitHub Releases page](https://github.com/kabsdk/kube-secret-gateway/releases).
 
 Create the configuration directory and install the example files:
 
@@ -84,9 +93,6 @@ gateway. Once it succeeds, start the agent:
 sudo systemctl daemon-reload
 sudo systemctl enable --now kube-secret-gateway-agent
 ```
-
-`scripts/build-release.sh` can be used to create cross-platform release
-binaries and a `SHA256SUMS` file.
 
 ## Configuration
 
@@ -335,3 +341,13 @@ go vet ./...
 
 Tests use an in-memory gateway and do not require Kubernetes or network
 access. The agent and gateway test suites both pin the bundle wire format.
+
+Build a local development binary with:
+
+```sh
+go build -o kube-secret-gateway-agent ./cmd/kube-secret-gateway-agent
+```
+
+Maintainers can use `scripts/build-release.sh` to create cross-platform
+binaries and a `SHA256SUMS` file. Published artifacts are produced by the
+repository release workflow.
