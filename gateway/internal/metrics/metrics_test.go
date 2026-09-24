@@ -278,12 +278,20 @@ func eventuallyAtLeast(t *testing.T, f *fixture, name string, labels map[string]
 
 func TestSharedSecretHasOneResourceSeries(t *testing.T) {
 	f := newFixture(t, seedAll)
+	refs := []exposure.SecretRef{certRef, matrixRef, authRef}
+	for _, ref := range refs {
+		// WaitInitialized guarantees that the initial list completed, but a
+		// watcher may not have been scheduled yet. Wait for the observable
+		// connected state before asserting how many watches were created.
+		expectValue(t, f, "kube_secret_gateway_watch_connected", refLabels(ref), 1)
+	}
+
 	// my-cert (shared by two exposures), matrix-cert, and the auth Secret
 	// shared by all three.
 	if n := seriesCount(t, f.reg, "kube_secret_gateway_watch_connected"); n != 3 {
 		t.Fatalf("got %d watch_connected series, want 3", n)
 	}
-	for _, ref := range []exposure.SecretRef{certRef, authRef} {
+	for _, ref := range refs {
 		if n := f.api.CallCount(kubetest.Watch, ref); n != 1 {
 			t.Fatalf("%s watched %d times, want once", ref, n)
 		}
