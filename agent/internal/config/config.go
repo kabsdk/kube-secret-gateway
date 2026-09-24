@@ -19,6 +19,7 @@ import (
 	"io"
 	"io/fs"
 	"maps"
+	"net"
 	"net/url"
 	"os"
 	"regexp"
@@ -35,6 +36,9 @@ const (
 	DefaultPath = "/etc/kube-secret-gateway-agent/config.yaml"
 	// DefaultStateDir holds one state file and one stamp file per bundle.
 	DefaultStateDir = "/var/lib/kube-secret-gateway-agent"
+	// DefaultMetricsListenAddress makes the endpoint reachable by an external
+	// Prometheus server. Operators should restrict it with a host firewall.
+	DefaultMetricsListenAddress = "0.0.0.0:9091"
 
 	// DefaultTimeout bounds one HTTP request to the gateway.
 	DefaultTimeout = 30 * time.Second
@@ -67,6 +71,7 @@ func (e *Error) Error() string {
 // Config is a validated configuration.
 type Config struct {
 	Gateway  Gateway
+	Metrics  Metrics
 	Bundles  []Bundle
 	exposure map[string]Credentials
 }
@@ -80,6 +85,11 @@ type Gateway struct {
 	// gateway. Empty means the system pool.
 	CAFile  string
 	Timeout time.Duration
+}
+
+// Metrics configures the Prometheus listener used in continuous mode.
+type Metrics struct {
+	ListenAddress string
 }
 
 // Credentials says where an exposure's Basic Auth credentials are read from.
@@ -211,6 +221,7 @@ func Parse(data []byte) (*Config, error) {
 // Config and is the only place that reports problems.
 type document struct {
 	Gateway   gatewayDoc    `yaml:"gateway"`
+	Metrics   metricsDoc    `yaml:"metrics"`
 	Exposures []exposureDoc `yaml:"exposures"`
 	Bundles   []bundleDoc   `yaml:"bundles"`
 }
@@ -219,6 +230,10 @@ type gatewayDoc struct {
 	URL     string `yaml:"url"`
 	CAFile  string `yaml:"caFile"`
 	Timeout string `yaml:"timeout"`
+}
+
+type metricsDoc struct {
+	ListenAddress *string `yaml:"listenAddress"`
 }
 
 type exposureDoc struct {
@@ -271,7 +286,10 @@ func (d *document) resolve() (*Config, error) {
 	var problems []string
 	add := func(format string, args ...any) { problems = append(problems, fmt.Sprintf(format, args...)) }
 
-	cfg := &Config{exposure: make(map[string]Credentials, len(d.Exposures))}
+	cfg := &Config{
+		Metrics:  Metrics{ListenAddress: DefaultMetricsListenAddress},
+		exposure: make(map[string]Credentials, len(d.Exposures)),
+	}
 
 	// gateway
 	switch {
@@ -304,6 +322,14 @@ func (d *document) resolve() (*Config, error) {
 		default:
 			cfg.Gateway.Timeout = timeout
 		}
+	}
+
+	// metrics
+	if d.Metrics.ListenAddress != nil {
+		cfg.Metrics.ListenAddress = *d.Metrics.ListenAddress
+	}
+	if err := validateListenAddress(cfg.Metrics.ListenAddress); err != nil {
+		add("metrics.listenAddress: %v", err)
 	}
 
 	// exposures
@@ -450,4 +476,18 @@ func (d *document) resolve() (*Config, error) {
 		return nil, &Error{Problems: problems}
 	}
 	return cfg, nil
+}
+
+func validateListenAddress(addr string) error {
+	if addr == "" {
+		return errors.New("must not be empty")
+	}
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("invalid address %q: expected host:port such as \"0.0.0.0:9091\"", addr)
+	}
+	if _, err := strconv.ParseUint(port, 10, 16); err != nil {
+		return fmt.Errorf("invalid port %q in %q", port, addr)
+	}
+	return nil
 }

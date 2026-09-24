@@ -100,6 +100,9 @@ gateway:
   caFile: /etc/kube-secret-gateway-agent/gateway-ca.crt
   timeout: 30s
 
+metrics:
+  listenAddress: 0.0.0.0:9091
+
 exposures:
   - name: my-cert
     username: fetcher
@@ -130,6 +133,18 @@ restart.
 Use HTTPS whenever the connection leaves an already encrypted, trusted
 network. When `caFile` is set, it replaces rather than extends the system trust
 store for this connection.
+
+### Metrics listener
+
+| Field           | Required | Meaning                                                              |
+| --------------- | -------- | -------------------------------------------------------------------- |
+| `listenAddress` | no       | Prometheus listener used in continuous mode; default `0.0.0.0:9091`. |
+
+The default accepts connections on every IPv4 interface so an external
+Prometheus server can scrape the host. Restrict port 9091 to the Prometheus
+servers with the host firewall. Bind to `127.0.0.1:9091` instead when scraping
+through a local collector. One-shot runs do not open the listener because they
+exit after synchronization.
 
 ### Exposure credentials
 
@@ -197,6 +212,42 @@ in `examples/nginx-reload.path` and `examples/nginx-reload.service`.
 
 Watch the stamp rather than an individual destination file. The stamp changes
 only after every configured destination file has been replaced.
+
+## Prometheus metrics
+
+In continuous mode, the agent serves Prometheus metrics at `/metrics` on the
+configured metrics listener. With the default configuration:
+
+```text
+http://HOST:9091/metrics
+```
+
+The endpoint includes standard Go and process metrics plus:
+
+| Metric                                                             | Meaning                                                              |
+| ------------------------------------------------------------------ | -------------------------------------------------------------------- |
+| `kube_secret_gateway_agent_bundle_healthy`                         | Whether the latest sync attempt succeeded.                           |
+| `kube_secret_gateway_agent_sync_attempts_total`                    | Synchronization attempts.                                            |
+| `kube_secret_gateway_agent_sync_errors_total`                      | Failed synchronization attempts.                                     |
+| `kube_secret_gateway_agent_changes_total`                          | Successful syncs that installed changed files.                       |
+| `kube_secret_gateway_agent_last_attempt_timestamp_seconds`         | Time of the latest attempt.                                          |
+| `kube_secret_gateway_agent_last_successful_sync_timestamp_seconds` | Time of the latest successful sync, including an unchanged response. |
+| `kube_secret_gateway_agent_last_change_timestamp_seconds`          | Time files were last installed successfully.                         |
+| `kube_secret_gateway_agent_sync_duration_seconds`                  | Histogram of synchronization duration.                               |
+| `kube_secret_gateway_agent_build_info`                             | Running agent version.                                               |
+
+Per-bundle metrics use only configured bundle names as labels. Secret values,
+credentials, destination paths, and command output are never exposed.
+
+A basic Prometheus scrape configuration for an externally reachable listener
+is:
+
+```yaml
+scrape_configs:
+  - job_name: kube-secret-gateway-agent
+    static_configs:
+      - targets: [host.example.com:9091]
+```
 
 ## Update and failure behavior
 
@@ -269,8 +320,8 @@ invalid arguments, configuration, or credentials.
   snapshot across multiple Secrets.
 - The agent sets file modes but not owner or group.
 - Configuration changes require a restart.
-- The agent has no metrics listener. Use its logs, exit status, stamp files,
-  and the gateway's metrics for monitoring.
+- Metrics are available only while the agent runs continuously. Monitor
+  one-shot services through their exit status and systemd timer state.
 
 ## Development
 

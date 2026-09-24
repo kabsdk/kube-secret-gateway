@@ -43,6 +43,9 @@ func TestMinimalConfiguration(t *testing.T) {
 	if cfg.Gateway.Timeout != config.DefaultTimeout {
 		t.Fatalf("timeout = %s, want the default %s", cfg.Gateway.Timeout, config.DefaultTimeout)
 	}
+	if cfg.Metrics.ListenAddress != config.DefaultMetricsListenAddress {
+		t.Fatalf("metrics.listenAddress = %q, want %q", cfg.Metrics.ListenAddress, config.DefaultMetricsListenAddress)
+	}
 	if len(cfg.Bundles) != 1 {
 		t.Fatalf("%d bundles", len(cfg.Bundles))
 	}
@@ -73,6 +76,8 @@ gateway:
   url: https://gateway.example.com/ksg/
   caFile: /etc/ssl/certs/internal-ca.crt
   timeout: 10s
+metrics:
+  listenAddress: 192.0.2.20:9101
 exposures:
   - name: my-cert
     username: fetcher
@@ -106,6 +111,9 @@ bundles:
 	}
 	if cfg.Gateway.Timeout != 10*time.Second || cfg.Gateway.CAFile != "/etc/ssl/certs/internal-ca.crt" {
 		t.Fatalf("gateway = %+v", cfg.Gateway)
+	}
+	if cfg.Metrics.ListenAddress != "192.0.2.20:9101" {
+		t.Fatalf("metrics = %+v", cfg.Metrics)
 	}
 
 	nginx := cfg.Bundles[0]
@@ -142,6 +150,9 @@ func TestInvalidConfigurations(t *testing.T) {
 		{"url with credentials", strings.Replace(minimal, "https://gateway.example.com", "https://u:p@gateway.example.com", 1), "must not carry credentials"},
 		{"url with query", strings.Replace(minimal, "https://gateway.example.com", "https://gateway.example.com?a=1", 1), "must not carry credentials, a query or a fragment"},
 		{"timeout too short", strings.Replace(minimal, "  url:", "  timeout: 1ms\n  url:", 1), "outside 1s..10m0s"},
+		{"empty metrics address", strings.Replace(minimal, "exposures:", "metrics:\n  listenAddress: \"\"\nexposures:", 1), "metrics.listenAddress: must not be empty"},
+		{"bad metrics address", strings.Replace(minimal, "exposures:", "metrics:\n  listenAddress: localhost\nexposures:", 1), "expected host:port"},
+		{"bad metrics port", strings.Replace(minimal, "exposures:", "metrics:\n  listenAddress: localhost:nope\nexposures:", 1), "invalid port"},
 		{"no exposures", "gateway:\n  url: https://g.example.com\nbundles:\n  - name: b\n    exposure: e\n    files: {k: /tmp/k}\n", "at least one exposure"},
 		{"no bundles", "gateway:\n  url: https://g.example.com\nexposures:\n  - name: e\n    username: u\n    passwordEnv: P\n", "at least one bundle"},
 		{"no credential source", strings.Replace(minimal, "    passwordFile: /etc/kube-secret-gateway-agent/password", "", 1), "one of credentialsFile, passwordFile or passwordEnv is required"},

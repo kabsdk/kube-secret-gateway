@@ -11,18 +11,24 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"slices"
 	"strings"
 	"syscall"
+	"time"
 
 	"kube-secret-gateway-agent/internal/config"
 	"kube-secret-gateway-agent/internal/fetch"
 	"kube-secret-gateway-agent/internal/gateway"
+	"kube-secret-gateway-agent/internal/metrics"
 )
 
 const appName = "kube-secret-gateway-agent"
+
+const metricsShutdownTimeout = 5 * time.Second
 
 // version is set at build time with -ldflags "-X main.version=...".
 var version = "dev"
@@ -98,11 +104,17 @@ func run(parent context.Context, args []string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
+	agentMetrics, err := metrics.New(cfg.Bundles, version)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
 	runner, err := fetch.NewRunner(cfg, fetch.Options{
 		Client:         client,
 		StateDir:       *stateDir,
 		Logger:         log,
 		CommandTimeout: *commandTimeout,
+		Observer:       agentMetrics,
 	})
 	if err != nil {
 		fmt.Fprintln(stderr, err)
@@ -121,9 +133,52 @@ func run(parent context.Context, args []string, stderr io.Writer) int {
 		}
 		return 0
 	}
-	runner.Serve(ctx)
+
+	listener, err := net.Listen("tcp", cfg.Metrics.ListenAddress)
+	if err != nil {
+		log.Error("cannot listen for metrics", "address", cfg.Metrics.ListenAddress, "error", err)
+		return 1
+	}
+	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", agentMetrics.Handler())
+	metricsServer := &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       time.Minute,
+		MaxHeaderBytes:    32 << 10,
+	}
+	serverErr := make(chan error, 1)
+	go func() { serverErr <- metricsServer.Serve(listener) }()
+	log.Info("metrics listener started", "address", listener.Addr(), "path", "/metrics")
+
+	runnerDone := make(chan struct{})
+	go func() {
+		runner.Serve(ctx)
+		close(runnerDone)
+	}()
+
+	exitCode := 0
+	select {
+	case <-runnerDone:
+	case err := <-serverErr:
+		if !errors.Is(err, http.ErrServerClosed) {
+			log.Error("metrics listener stopped", "error", err)
+			exitCode = 1
+		}
+		stop()
+		<-runnerDone
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), metricsShutdownTimeout)
+	if err := metricsServer.Shutdown(shutdownCtx); err != nil {
+		log.Error("cannot stop metrics listener", "error", err)
+		exitCode = 1
+	}
+	cancel()
 	log.Info("stopped")
-	return 0
+	return exitCode
 }
 
 // selectBundles narrows the configuration to the named bundles.

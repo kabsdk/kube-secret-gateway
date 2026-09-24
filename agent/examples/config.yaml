@@ -6,6 +6,11 @@ gateway:
   caFile: /etc/ssl/certs/internal-ca.crt
   timeout: 30s
 
+# The long-running agent exposes Prometheus metrics here. Restrict this port to
+# your Prometheus servers with the host firewall.
+metrics:
+  listenAddress: 0.0.0.0:9091
+
 # Credentials are read again before every fetch, so rotating this file needs
 # no agent restart.
 exposures:

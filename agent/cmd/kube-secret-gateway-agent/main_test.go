@@ -3,6 +3,9 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -50,6 +53,8 @@ func setup(t *testing.T, bundles string) (configPath, installDir string, gw *gwt
 	body := fmt.Sprintf(`
 gateway:
   url: %s
+metrics:
+  listenAddress: "127.0.0.1:0"
 exposures:
   - name: my-cert
     username: fetcher
@@ -232,7 +237,26 @@ func TestVersionFlag(t *testing.T) {
 // parent context is what SIGTERM does to the real process.
 func TestDaemonStopsOnCancellation(t *testing.T) {
 	configPath, dir, _ := setup(t, "")
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	metricsAddress := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	configBody, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configBody = []byte(strings.Replace(string(configBody), `"127.0.0.1:0"`, metricsAddress, 1))
+	if err := os.WriteFile(configPath, configBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	httpClient := &http.Client{Timeout: time.Second}
 
 	type result struct {
 		code   int
@@ -249,7 +273,18 @@ func TestDaemonStopsOnCancellation(t *testing.T) {
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		if _, err := os.Stat(filepath.Join(dir, "tls.crt")); err == nil {
-			break
+			resp, err := httpClient.Get("http://" + metricsAddress + "/metrics")
+			if err == nil {
+				body, readErr := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				if readErr != nil {
+					t.Fatal(readErr)
+				}
+				if resp.StatusCode == http.StatusOK && strings.Contains(string(body),
+					`kube_secret_gateway_agent_sync_attempts_total{bundle="nginx-tls"} 1`) {
+					break
+				}
+			}
 		}
 		if time.Now().After(deadline) {
 			cancel()

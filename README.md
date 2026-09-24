@@ -25,6 +25,10 @@ The gateway exposes only explicitly selected Secrets and keys. Kubernetes RBAC
 still controls what the gateway itself may read. The gateway stores values
 only in memory and never writes them to disk.
 
+Both long-running components expose Prometheus metrics: the gateway reports
+Secret, watch, and HTTP state, while the agent reports synchronization health
+for each configured bundle. Neither endpoint exposes Secret values.
+
 ## Repository layout
 
 ```text

@@ -49,7 +49,18 @@ type Options struct {
 	StateDir       string
 	Logger         *slog.Logger
 	CommandTimeout time.Duration
+	Observer       Observer
 }
+
+// Observer receives one event after every bundle synchronization attempt.
+// Implementations must be safe for concurrent calls from different bundles.
+type Observer interface {
+	ObserveSync(bundle string, changed bool, err error, duration time.Duration)
+}
+
+type discardObserver struct{}
+
+func (discardObserver) ObserveSync(string, bool, error, time.Duration) {}
 
 // Runner syncs the bundles of one configuration.
 type Runner struct {
@@ -58,6 +69,7 @@ type Runner struct {
 	stateDir string
 	log      *slog.Logger
 	timeout  time.Duration
+	observer Observer
 	// env is the environment for onChangeCommand: this process's, without any
 	// variable that holds a password.
 	env []string
@@ -75,12 +87,17 @@ func NewRunner(cfg *config.Config, opts Options) (*Runner, error) {
 	if timeout <= 0 {
 		timeout = DefaultCommandTimeout
 	}
+	observer := opts.Observer
+	if observer == nil {
+		observer = discardObserver{}
+	}
 	return &Runner{
 		cfg:      cfg,
 		client:   opts.Client,
 		stateDir: opts.StateDir,
 		log:      opts.Logger,
 		timeout:  timeout,
+		observer: observer,
 		env:      scrubbed(os.Environ(), cfg.PasswordEnvNames()),
 	}, nil
 }
@@ -155,6 +172,9 @@ func (r *Runner) serveBundle(ctx context.Context, b config.Bundle) {
 // Sync fetches one bundle and installs it if anything changed. It reports
 // whether files were written.
 func (r *Runner) Sync(ctx context.Context, b config.Bundle) (changed bool, err error) {
+	started := time.Now()
+	defer func() { r.observer.ObserveSync(b.Name, changed, err, time.Since(started)) }()
+
 	log := r.log.With("bundle", b.Name)
 
 	username, password, err := r.cfg.Credentials(b).Resolve()
