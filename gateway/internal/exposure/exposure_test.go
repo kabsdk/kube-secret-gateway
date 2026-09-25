@@ -6,33 +6,6 @@ import (
 	"testing"
 )
 
-func TestKeyFilter(t *testing.T) {
-	all := KeyFilter{}
-	if !all.Exposes("anything") || all.Required("anything") || all.RequiredKeys() != nil {
-		t.Error("zero KeyFilter must expose every key and require none")
-	}
-
-	inc := IncludeKeys("tls.crt", "tls.key", "tls.crt")
-	if !inc.Exposes("tls.crt") || inc.Exposes("ca.crt") {
-		t.Error("IncludeKeys exposes the wrong keys")
-	}
-	if !inc.Required("tls.key") || inc.Required("ca.crt") {
-		t.Error("IncludeKeys must require exactly the included keys")
-	}
-	if got := inc.RequiredKeys(); !slices.Equal(got, []string{"tls.crt", "tls.key"}) {
-		t.Errorf("RequiredKeys = %v (order kept, duplicates dropped)", got)
-	}
-	inc.RequiredKeys()[0] = "mutated"
-	if inc.RequiredKeys()[0] != "tls.crt" {
-		t.Error("RequiredKeys must return a copy")
-	}
-
-	exc := ExcludeKeys("tls.key")
-	if exc.Exposes("tls.key") || !exc.Exposes("tls.crt") || exc.Required("tls.crt") || exc.RequiredKeys() != nil {
-		t.Error("ExcludeKeys semantics wrong")
-	}
-}
-
 func TestAllowsClient(t *testing.T) {
 	e := Exposure{AllowedCIDRs: []netip.Prefix{
 		netip.MustParsePrefix("10.10.30.40/32"),

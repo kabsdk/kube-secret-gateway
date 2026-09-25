@@ -25,20 +25,22 @@ import (
 const testConfig = `
 kubernetes:
   defaultNamespace: certificates
-secrets:
-  - secretRef: {name: my-cert}
+exposures:
+  - name: my-cert
+    secretRef: {name: my-cert}
+    keys: [tls.crt]
     allowedCidrs: [10.0.0.0/8]
-    auth: {type: basicAuth, secretRef: {namespace: certificate-auth, name: my-cert-fetcher-credentials}}
+    auth: {secretRef: {namespace: certificate-auth, name: my-cert-fetcher-credentials}}
   - name: matrix-prod
     secretRef: {namespace: matrix-prod, name: matrix-cert}
     allowedCidrs: [10.0.0.0/8]
-    auth: {type: basicAuth, secretRef: {namespace: certificate-auth, name: my-cert-fetcher-credentials}}
-    includeKeys: [tls.crt, tls.key]
+    auth: {secretRef: {namespace: certificate-auth, name: my-cert-fetcher-credentials}}
+    keys: [tls.crt, tls.key]
   - name: my-cert-public
     secretRef: {name: my-cert}
     allowedCidrs: [10.0.0.0/8]
-    auth: {type: basicAuth, secretRef: {namespace: certificate-auth, name: my-cert-fetcher-credentials}}
-    excludeKeys: [tls.key]
+    auth: {secretRef: {namespace: certificate-auth, name: my-cert-fetcher-credentials}}
+    keys: [tls.crt]
 `
 
 var (
@@ -218,9 +220,9 @@ func TestExpectedKeyPresence(t *testing.T) {
 	expectValue(t, f, name, key, 1)
 	expectValue(t, f, "kube_secret_gateway_exposure_healthy", healthy, 1)
 
-	// Only includeKeys produce expected-key series.
-	if _, ok := value(t, f.reg, name, map[string]string{"exposure": "my-cert", "key": "tls.crt"}); ok {
-		t.Fatal("expected_key_present emitted for an exposure without includeKeys")
+	// Every configured key has a presence series.
+	if _, ok := value(t, f.reg, name, map[string]string{"exposure": "my-cert", "key": "tls.crt"}); !ok {
+		t.Fatal("expected_key_present missing for a configured key")
 	}
 }
 

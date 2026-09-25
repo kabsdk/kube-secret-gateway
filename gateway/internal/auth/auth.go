@@ -8,10 +8,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"errors"
-	"fmt"
 	"net/http"
-
-	"kube-secret-gateway/internal/exposure"
 )
 
 // Realm is the HTTP authentication realm announced to clients.
@@ -28,30 +25,7 @@ var (
 	ErrMissingUsername = errors.New(`authentication Secret has no non-empty "username" key`)
 	// ErrMissingPassword means the Secret lacks a non-empty "password" key.
 	ErrMissingPassword = errors.New(`authentication Secret has no non-empty "password" key`)
-	// ErrUnsupportedType means the authentication type is not implemented.
-	ErrUnsupportedType = errors.New("unsupported authentication type")
 )
-
-// Verifier checks the credentials presented with a request.
-type Verifier interface {
-	// Verify reports whether r carries valid credentials. It never reveals
-	// which part of the credentials was wrong.
-	Verify(r *http.Request) bool
-	// Challenge is the WWW-Authenticate header value for 401 responses.
-	Challenge() string
-}
-
-// NewVerifier builds a Verifier of type t from the authentication Secret's
-// data. An error means the Secret is unusable (malformed), which callers must
-// treat as an operational failure, not as a client error.
-func NewVerifier(t exposure.AuthType, data map[string][]byte) (Verifier, error) {
-	switch t {
-	case exposure.AuthBasic:
-		return NewBasic(data)
-	default:
-		return nil, fmt.Errorf("%w %q", ErrUnsupportedType, t)
-	}
-}
 
 // Basic verifies HTTP Basic credentials. It holds only SHA-256 digests of the
 // expected username and password; comparing fixed-size digests keeps the
@@ -74,7 +48,8 @@ func NewBasic(data map[string][]byte) (*Basic, error) {
 	return &Basic{username: sha256.Sum256(username), password: sha256.Sum256(password)}, nil
 }
 
-// Verify implements Verifier.
+// Verify reports whether the request contains the expected Basic Auth
+// credentials.
 func (b *Basic) Verify(r *http.Request) bool {
 	username, password, ok := r.BasicAuth()
 	if !ok {
@@ -91,7 +66,7 @@ func (b *Basic) matches(username, password string) bool {
 	return subtle.ConstantTimeCompare(u[:], b.username[:])&subtle.ConstantTimeCompare(p[:], b.password[:]) == 1
 }
 
-// Challenge implements Verifier.
+// Challenge returns the HTTP Basic authentication challenge.
 func (b *Basic) Challenge() string {
 	return `Basic realm="` + Realm + `"`
 }

@@ -1,9 +1,8 @@
 // Package server implements the two HTTP listeners.
 //
-// The Secrets listener serves only
+// The delivery listener serves only
 //
-//	GET /secrets/{exposure}/{key}   raw Secret value
-//	GET /bundles/{exposure}         every key the exposure serves, as JSON
+//	GET|HEAD /exposures/{name}   every configured key, as canonical JSON
 //
 // and the metrics listener, on its own port, serves
 //
@@ -11,22 +10,17 @@
 //	GET /readyz                     readiness
 //	GET /metrics                    Prometheus metrics, optionally authenticated
 //
-// Keeping them apart means only /secrets/ and /bundles/ need to be reachable
+// Keeping them apart means only /exposures/ needs to be reachable
 // through the ingress, and nothing on that port reveals which exposures exist.
 //
-// The bundle route exists so that a client can install several keys that
-// belong together, such as a certificate and its private key, without ever
-// mixing two versions of the Secret. One request reads one Secret from memory
-// once, so the response is a snapshot of a single incarnation and carries one
-// ETag for the whole set. Fetching the keys one at a time cannot offer that:
-// an update can land between two requests.
+// One request reads one Secret from memory once, so the response is an atomic
+// snapshot and carries one ETag for the complete exposure.
 //
 // Routing is done on the escaped request path by this package itself rather
 // than by http.ServeMux, which cleans paths and answers with redirects. A
-// Secret path must consist of exactly two segments, and a bundle path of
-// exactly one, made only of characters that valid exposure names and Secret
-// keys can contain, so percent-encoding, dot segments and extra separators
-// are all rejected before any lookup.
+// path must consist of exactly one valid exposure name segment, so
+// percent-encoding, dot segments and extra separators are rejected before any
+// lookup.
 package server
 
 import (
@@ -64,10 +58,7 @@ const (
 	MaxHeaderBytes    = 32 << 10
 )
 
-const (
-	secretsPrefix = "/secrets/"
-	bundlesPrefix = "/bundles/"
-)
+const exposuresPrefix = "/exposures/"
 
 // SecretSource provides the current state of watched Secrets. It must answer
 // from memory; the handler calls it on every request.
@@ -75,7 +66,7 @@ type SecretSource interface {
 	Secret(ref exposure.SecretRef) resources.Secret
 }
 
-// RequestObserver records the outcome of Secret endpoint requests. name is
+// RequestObserver records the outcome of exposure endpoint requests. name is
 // empty for requests that did not resolve to a configured exposure; reason is
 // always one of the Reason constants.
 type RequestObserver interface {
@@ -97,8 +88,7 @@ const (
 	ReasonAuthSecretMalformed     = "auth_secret_malformed"
 	ReasonUnauthorized            = "unauthorized"
 	ReasonSourceSecretUnavailable = "source_secret_unavailable"
-	ReasonExpectedKeyMissing      = "expected_key_missing"
-	ReasonKeyNotFound             = "key_not_found"
+	ReasonConfiguredKeyMissing    = "configured_key_missing"
 	ReasonInternalError           = "internal_error"
 )
 
@@ -111,7 +101,7 @@ type Options struct {
 	Logger    *slog.Logger
 }
 
-// Handler serves the Secrets listener.
+// Handler serves the delivery listener.
 type Handler struct {
 	exposures map[string]*exposure.Exposure
 	secrets   SecretSource
@@ -120,7 +110,7 @@ type Handler struct {
 	log       *slog.Logger
 }
 
-// New returns the handler for the Secrets listener.
+// New returns the handler for the delivery listener.
 func New(opts Options) (*Handler, error) {
 	if opts.Secrets == nil || opts.ClientIP == nil || opts.Observer == nil || opts.Logger == nil {
 		return nil, errors.New("server: incomplete options")
@@ -155,8 +145,8 @@ func NewHTTPServer(h http.Handler, log *slog.Logger) *http.Server {
 	}
 }
 
-// ServeHTTP handles every request on the Secrets listener. Anything that is
-// not a well-formed Secret or bundle path is a 404, including the probe and
+// ServeHTTP handles every request on the delivery listener. Anything that is
+// not a well-formed exposure path is a 404, including the probe and
 // metrics paths, which live on the metrics listener.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.serveRequest(w, r)
@@ -166,8 +156,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // holds credentials or Secret data.
 type outcome struct {
 	name   string // configured exposure name; empty if none matched
-	key    string // requested key, or the missing required key of a bundle
-	bundle bool   // the request was for /bundles/{exposure}
+	key    string // missing configured key, when unhealthy
 	client netip.Addr
 	peer   netip.Addr
 	status int
@@ -195,7 +184,7 @@ func (h *Handler) serveRequest(w http.ResponseWriter, r *http.Request) {
 	h.handleRequest(sw, r, o)
 }
 
-// handleRequest runs the request pipeline for both routes. The order of the
+// handleRequest runs the request pipeline. The order of the
 // checks decides what a caller can learn about the configuration:
 //
 //  1. Malformed path, unknown exposure, or a client outside the exposure's
@@ -205,18 +194,8 @@ func (h *Handler) serveRequest(w http.ResponseWriter, r *http.Request) {
 //  2. Authentication Secret missing or malformed: 503.
 //  3. Missing or wrong credentials: 401. Nothing about keys is revealed
 //     before this point.
-//  4. Source Secret absent: 503, whatever the key.
-//  5. Key not served: 503 if listed in includeKeys (the configuration
-//     promises it), otherwise 404. includeKeys and excludeKeys define which
-//     keys the exposure has at all, so a filtered-out key is simply one that
-//     does not exist, not a separate case.
-//  6. The value, or 304 if the client already has it.
-//
-// Both routes run steps 1 to 4 identically, so a bundle reveals nothing that
-// a single key does not. They differ only at step 5: a bundle has no
-// requested key, so it cannot answer key_not_found, but a key promised by
-// includeKeys and absent from the Secret is still 503, exactly as it is for a
-// single key.
+//  4. Source Secret absent or any configured key missing: 503.
+//  5. The complete exposure snapshot, or 304 if the client already has it.
 func (h *Handler) handleRequest(w http.ResponseWriter, r *http.Request, o *outcome) {
 	fail := func(status int, reason string) {
 		o.status, o.reason = status, reason
@@ -233,19 +212,22 @@ func (h *Handler) handleRequest(w http.ResponseWriter, r *http.Request, o *outco
 		fail(http.StatusMethodNotAllowed, ReasonMethodNotAllowed)
 		return
 	}
-	rt, ok := parseRoute(r.URL.EscapedPath())
+	name, ok := parseRoute(r.URL.EscapedPath())
+	if r.URL.ForceQuery || r.URL.RawQuery != "" || r.ContentLength != 0 || len(r.TransferEncoding) > 0 {
+		ok = false
+	}
 	if !ok {
 		fail(http.StatusNotFound, ReasonNoRoute)
 		return
 	}
 	// Only configured names are looked up; an arbitrary name never reaches
 	// the resource cache or the Kubernetes API.
-	exp := h.exposures[rt.name]
+	exp := h.exposures[name]
 	if exp == nil {
 		fail(http.StatusNotFound, ReasonUnknownExposure)
 		return
 	}
-	o.name, o.key, o.bundle = exp.Name, rt.key, rt.bundle
+	o.name = exp.Name
 	if ipErr != nil {
 		fail(http.StatusNotFound, ReasonClientAddressUnresolved)
 		return
@@ -260,7 +242,7 @@ func (h *Handler) handleRequest(w http.ResponseWriter, r *http.Request, o *outco
 		fail(http.StatusServiceUnavailable, ReasonAuthSecretUnavailable)
 		return
 	}
-	verifier, err := auth.NewVerifier(exp.Auth.Type, authSecret.Data)
+	verifier, err := auth.NewBasic(authSecret.Data)
 	if err != nil {
 		fail(http.StatusServiceUnavailable, ReasonAuthSecretMalformed)
 		return
@@ -276,94 +258,48 @@ func (h *Handler) handleRequest(w http.ResponseWriter, r *http.Request, o *outco
 		fail(http.StatusServiceUnavailable, ReasonSourceSecretUnavailable)
 		return
 	}
-	var body []byte
-	contentType := "application/octet-stream"
-	if rt.bundle {
-		missing, b := bundleBody(source.Data, exp.Keys)
-		if missing != "" {
-			// Named in the log so that an operator sees which promised key
-			// the Secret is missing, as for a single-key request.
-			o.key = missing
-			fail(http.StatusServiceUnavailable, ReasonExpectedKeyMissing)
-			return
-		}
-		body, contentType = b, "application/json"
-	} else {
-		value, ok := source.Data[rt.key]
-		if !ok || !exp.Keys.Exposes(rt.key) {
-			if exp.Keys.Required(rt.key) {
-				fail(http.StatusServiceUnavailable, ReasonExpectedKeyMissing)
-			} else {
-				fail(http.StatusNotFound, ReasonKeyNotFound)
-			}
-			return
-		}
-		body = value
+	missing, body := exposureBody(source.Data, exp.Keys)
+	if missing != "" {
+		o.key = missing
+		fail(http.StatusServiceUnavailable, ReasonConfiguredKeyMissing)
+		return
 	}
-	o.status = writeBody(w, r, body, source.UID, contentType)
+	o.status = writeBody(w, r, body, source.UID, "application/json")
 	o.reason = ReasonServed
 	if o.status == http.StatusNotModified {
 		o.reason = ReasonNotModified
 	}
 }
 
-// route is a parsed request path: one exposure, and either one key or the
-// whole bundle.
-type route struct {
-	name   string
-	key    string // empty when bundle is true
-	bundle bool
+// parseRoute accepts exactly /exposures/{name} from the escaped path.
+func parseRoute(escaped string) (string, bool) {
+	name, found := strings.CutPrefix(escaped, exposuresPrefix)
+	if !found || strings.Contains(name, "/") || exposure.ValidateName(name) != nil {
+		return "", false
+	}
+	return name, true
 }
 
-// parseRoute parses /secrets/{exposure}/{key} or /bundles/{exposure} from the
-// escaped path. Validation happens on the escaped form, and the accepted
-// character sets exclude '%', so no encoded separator or dot segment can be
-// reinterpreted. A trailing slash leaves an empty final segment, which fails
-// validation, so neither route accepts one.
-func parseRoute(escaped string) (route, bool) {
-	if rest, found := strings.CutPrefix(escaped, secretsPrefix); found {
-		name, key, split := strings.Cut(rest, "/")
-		if !split || strings.Contains(key, "/") {
-			return route{}, false
-		}
-		if exposure.ValidateName(name) != nil || exposure.ValidateKey(key) != nil {
-			return route{}, false
-		}
-		return route{name: name, key: key}, true
-	}
-	if rest, found := strings.CutPrefix(escaped, bundlesPrefix); found {
-		if strings.Contains(rest, "/") || exposure.ValidateName(rest) != nil {
-			return route{}, false
-		}
-		return route{name: rest, bundle: true}, true
-	}
-	return route{}, false
-}
-
-// bundleBody serialises every key the exposure serves, or names the first key
-// that includeKeys promises and the Secret does not have.
+// exposureBody serialises every configured key, or names the first one that
+// the Kubernetes Secret does not have.
 //
 // Keys are sorted, so the body, and with it the ETag, depends only on the
-// Secret's contents and the exposure's key filter, never on map iteration
+// Secret's configured contents, never on map iteration
 // order. Values are base64 so that arbitrary bytes survive JSON. Secret keys
 // are restricted to [-._a-zA-Z0-9] by exposure.ValidateKey, so no key can
 // contain a character that JSON would have to escape.
-func bundleBody(data map[string][]byte, filter exposure.KeyFilter) (missing string, body []byte) {
-	for _, k := range filter.RequiredKeys() {
+func exposureBody(data map[string][]byte, configured []string) (missing string, body []byte) {
+	keys := append([]string(nil), configured...)
+	for _, k := range keys {
 		if _, ok := data[k]; !ok {
 			return k, nil
 		}
 	}
-	keys := make([]string, 0, len(data))
+	slices.Sort(keys)
 	size := 2
-	for k := range data {
-		if !filter.Exposes(k) {
-			continue
-		}
-		keys = append(keys, k)
+	for _, k := range keys {
 		size += len(k) + base64.StdEncoding.EncodedLen(len(data[k])) + 6
 	}
-	slices.Sort(keys)
 
 	var b bytes.Buffer
 	b.Grow(size)
@@ -383,9 +319,8 @@ func bundleBody(data map[string][]byte, filter exposure.KeyFilter) (missing stri
 }
 
 // ETag returns the entity tag for a response body: HMAC-SHA256 of the bytes
-// served, keyed with the Secret's UID. The bytes are a single Secret value on
-// the Secrets route and the canonical bundle body on the bundle route, so a
-// bundle's tag changes exactly when any key it contains changes.
+// served, keyed with the Secret's UID. The bytes are the canonical exposure
+// body, so the tag changes exactly when any configured key changes.
 //
 // A plain hash of the value would let anyone who sees the header, but not
 // the body (a "curl -v" in a CI log, a proxy logging response headers), test
@@ -448,9 +383,6 @@ func (h *Handler) finish(r *http.Request, o *outcome, elapsed time.Duration) {
 	attrs := make([]slog.Attr, 0, 9)
 	if o.name != "" {
 		attrs = append(attrs, slog.String("exposure", o.name))
-		if o.bundle {
-			attrs = append(attrs, slog.Bool("bundle", true))
-		}
 		if o.key != "" {
 			attrs = append(attrs, slog.String("key", o.key))
 		}

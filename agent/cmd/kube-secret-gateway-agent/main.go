@@ -1,6 +1,6 @@
-// Command kube-secret-gateway-agent synchronizes gateway bundles to local files.
+// Command kube-secret-gateway-agent synchronizes gateway exposures to local files.
 //
-// It runs either as a long-lived process, syncing each bundle on its own
+// It runs either as a long-lived process, syncing each exposure on its own
 // interval, or once and then exits, for a systemd timer or cron.
 package main
 
@@ -37,22 +37,22 @@ func main() {
 	os.Exit(run(context.Background(), os.Args[1:], os.Stderr))
 }
 
-// run returns the process exit code: 0 on success, 1 if any bundle failed, 2
+// run returns the process exit code: 0 on success, 1 if any exposure failed, 2
 // for a usage or configuration error.
 func run(parent context.Context, args []string, stderr io.Writer) int {
 	fs := flag.NewFlagSet(appName, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	configPath := fs.String("config", config.DefaultPath, "path to the YAML configuration file")
-	stateDir := fs.String("state-dir", config.DefaultStateDir, "directory for the per-bundle ETag and stamp files")
-	once := fs.Bool("once", false, "sync every selected bundle once and exit, instead of running on each bundle's interval")
-	only := fs.String("bundle", "", "comma-separated bundles to sync (default: all)")
+	stateDir := fs.String("state-dir", config.DefaultStateDir, "directory for the per-exposure ETag and stamp files")
+	once := fs.Bool("once", false, "sync every selected exposure once and exit, instead of running on each exposure's interval")
+	only := fs.String("exposure", "", "comma-separated exposures to sync (default: all)")
 	commandTimeout := fs.Duration("command-timeout", fetch.DefaultCommandTimeout, "how long one onChangeCommand may run")
 	logLevel := fs.String("log-level", "info", "log level: debug, info, warn or error")
 	logFormat := fs.String("log-format", "text", "log format: text or json")
 	check := fs.Bool("check", false, "validate the configuration and credentials, then exit without contacting the gateway")
 	showVersion := fs.Bool("version", false, "print the version and exit")
 	fs.Usage = func() {
-		fmt.Fprintf(stderr, "Usage: %s [flags]\n\nSynchronizes kube-secret-gateway bundles to local files.\n\nFlags:\n", appName)
+		fmt.Fprintf(stderr, "Usage: %s [flags]\n\nSynchronizes kube-secret-gateway exposures to local files.\n\nFlags:\n", appName)
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -83,7 +83,7 @@ func run(parent context.Context, args []string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
-	if err := selectBundles(cfg, *only); err != nil {
+	if err := selectExposures(cfg, *only); err != nil {
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
@@ -95,7 +95,7 @@ func run(parent context.Context, args []string, stderr io.Writer) int {
 		return 2
 	}
 	if *check {
-		fmt.Fprintf(stderr, "%s: configuration and credentials are valid (%d bundle(s))\n", *configPath, len(cfg.Bundles))
+		fmt.Fprintf(stderr, "%s: configuration and credentials are valid (%d exposure(s))\n", *configPath, len(cfg.Exposures))
 		return 0
 	}
 
@@ -104,7 +104,7 @@ func run(parent context.Context, args []string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
-	agentMetrics, err := metrics.New(cfg.Bundles, version)
+	agentMetrics, err := metrics.New(cfg.Exposures, version)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 2
@@ -125,7 +125,7 @@ func run(parent context.Context, args []string, stderr io.Writer) int {
 	defer stop()
 
 	log.Info("starting", "version", version, "gateway", client.BaseURL(),
-		"bundles", len(cfg.Bundles), "state_dir", *stateDir, "once", *once)
+		"exposures", len(cfg.Exposures), "state_dir", *stateDir, "once", *once)
 
 	if *once {
 		if err := runner.Once(ctx); err != nil {
@@ -181,52 +181,47 @@ func run(parent context.Context, args []string, stderr io.Writer) int {
 	return exitCode
 }
 
-// selectBundles narrows the configuration to the named bundles.
-func selectBundles(cfg *config.Config, only string) error {
+// selectExposures narrows the configuration to the named exposures.
+func selectExposures(cfg *config.Config, only string) error {
 	if only == "" {
 		return nil
 	}
 	wanted := strings.Split(only, ",")
 	var unknown []string
-	var chosen []config.Bundle
+	var chosen []config.Exposure
 	for _, name := range wanted {
 		name = strings.TrimSpace(name)
 		if name == "" {
 			continue
 		}
-		i := slices.IndexFunc(cfg.Bundles, func(b config.Bundle) bool { return b.Name == name })
+		i := slices.IndexFunc(cfg.Exposures, func(e config.Exposure) bool { return e.Name == name })
 		if i < 0 {
 			unknown = append(unknown, name)
 			continue
 		}
-		if !slices.ContainsFunc(chosen, func(b config.Bundle) bool { return b.Name == name }) {
-			chosen = append(chosen, cfg.Bundles[i])
+		if !slices.ContainsFunc(chosen, func(e config.Exposure) bool { return e.Name == name }) {
+			chosen = append(chosen, cfg.Exposures[i])
 		}
 	}
 	if len(unknown) > 0 {
-		configured := make([]string, len(cfg.Bundles))
-		for i, b := range cfg.Bundles {
-			configured[i] = b.Name
+		configured := make([]string, len(cfg.Exposures))
+		for i, e := range cfg.Exposures {
+			configured[i] = e.Name
 		}
-		return fmt.Errorf("no such bundle: %s (configured: %s)", strings.Join(unknown, ", "), strings.Join(configured, ", "))
+		return fmt.Errorf("no such exposure: %s (configured: %s)", strings.Join(unknown, ", "), strings.Join(configured, ", "))
 	}
 	if len(chosen) == 0 {
-		return errors.New("-bundle selected no bundles")
+		return errors.New("-exposure selected no exposures")
 	}
-	cfg.Bundles = chosen
+	cfg.Exposures = chosen
 	return nil
 }
 
-// checkCredentials resolves every bundle's credentials and throws them away.
+// checkCredentials resolves every exposure's credentials and throws them away.
 func checkCredentials(cfg *config.Config) error {
 	var errs []error
-	seen := make(map[string]struct{})
-	for _, b := range cfg.Bundles {
-		if _, done := seen[b.Exposure]; done {
-			continue
-		}
-		seen[b.Exposure] = struct{}{}
-		if _, _, err := cfg.Credentials(b).Resolve(); err != nil {
+	for _, e := range cfg.Exposures {
+		if _, _, err := e.Auth.Resolve(e.Name); err != nil {
 			errs = append(errs, err)
 		}
 	}

@@ -5,7 +5,7 @@
 // visible on the next scrape, without any client having to request it.
 //
 // Label values come only from configuration (exposure names, namespaces,
-// Secret names, includeKeys entries) or from small fixed sets (HTTP status
+// Secret names, configured keys) or from small fixed sets (HTTP status
 // codes, response reasons). Nothing a client sends can create a new series.
 package metrics
 
@@ -49,7 +49,7 @@ func New(exposures []exposure.Exposure, state State) (*Metrics, error) {
 		registry: prometheus.NewRegistry(),
 		requests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: prefix + "http_requests_total",
-			Help: `HTTP requests to Secret endpoints by exposure, status code and reason. Requests not matching a configured exposure are counted as exposure="` + UnknownExposure + `". The reason distinguishes outcomes that clients deliberately see as the same status, such as an unknown exposure and a client outside allowedCidrs (both 404).`,
+			Help: `HTTP requests to the exposure endpoint by exposure, status code and reason. Requests not matching a configured exposure are counted as exposure="` + UnknownExposure + `". The reason distinguishes outcomes that clients deliberately see as the same status, such as an unknown exposure and a client outside allowedCidrs (both 404).`,
 		}, []string{"exposure", "status", "reason"}),
 		names: make(map[string]struct{}, len(exposures)),
 	}
@@ -68,7 +68,7 @@ func New(exposures []exposure.Exposure, state State) (*Metrics, error) {
 	return m, nil
 }
 
-// ObserveRequest counts one Secret endpoint request. Exposure names that are
+// ObserveRequest counts one exposure endpoint request. Exposure names that are
 // not configured are folded into UnknownExposure, so arbitrary request paths
 // cannot create series. The reason must come from a fixed set of constants,
 // never from request data.
@@ -105,10 +105,10 @@ var (
 		"Whether the exposure's authentication Secret exists and contains usable credentials (non-empty username and password).",
 		exposureRefLabels, nil)
 	expectedKeyDesc = prometheus.NewDesc(prefix+"expected_key_present",
-		"Whether a key listed in the exposure's includeKeys is present in its source Secret.",
+		"Whether a configured exposure key is present in its source Secret.",
 		[]string{"exposure", "key"}, nil)
 	exposureHealthyDesc = prometheus.NewDesc(prefix+"exposure_healthy",
-		"Whether the exposure can serve requests: source Secret present, authentication Secret valid and every includeKeys entry present.",
+		"Whether the exposure can serve requests: source Secret present, authentication Secret valid and every configured key present.",
 		[]string{"exposure"}, nil)
 	watchConnectedDesc = prometheus.NewDesc(prefix+"watch_connected",
 		"Whether a watch on the Secret is currently established.",
@@ -158,7 +158,7 @@ func (c *stateCollector) Collect(ch chan<- prometheus.Metric) {
 		authSecret := c.state.Secret(e.Auth.SecretRef)
 		authValid := false
 		if authSecret.Present {
-			_, err := auth.NewVerifier(e.Auth.Type, authSecret.Data)
+			_, err := auth.NewBasic(authSecret.Data)
 			authValid = err == nil
 		}
 		healthy := src.Present && authValid
@@ -169,7 +169,7 @@ func (c *stateCollector) Collect(ch chan<- prometheus.Metric) {
 			e.Name, e.Auth.SecretRef.Namespace, e.Auth.SecretRef.Name)
 		ch <- prometheus.MustNewConstMetric(authValidDesc, prometheus.GaugeValue, boolValue(authValid),
 			e.Name, e.Auth.SecretRef.Namespace, e.Auth.SecretRef.Name)
-		for _, key := range e.Keys.RequiredKeys() {
+		for _, key := range e.Keys {
 			_, present := src.Data[key]
 			healthy = healthy && present
 			ch <- prometheus.MustNewConstMetric(expectedKeyDesc, prometheus.GaugeValue, boolValue(present), e.Name, key)

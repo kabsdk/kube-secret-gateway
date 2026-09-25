@@ -1,15 +1,4 @@
-// Package config loads and validates the YAML configuration.
-//
-// Validation is complete before anything else starts: a configuration that
-// loads successfully has a usable gateway URL, a credential source for every
-// exposure a bundle uses, absolute local paths that no two bundles share, and
-// intervals inside sane bounds. Whether the gateway answers, and whether the
-// credentials are correct, is runtime state and is deliberately not checked
-// here.
-//
-// Credential values are not part of a loaded configuration. Only where to
-// read them from is, so a long-running process does not hold passwords
-// between fetches; see Credentials.Resolve.
+// Package config loads and validates the agent YAML configuration.
 package config
 
 import (
@@ -18,12 +7,11 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"maps"
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -32,30 +20,18 @@ import (
 )
 
 const (
-	// DefaultPath is where the configuration is read from unless overridden.
-	DefaultPath = "/etc/kube-secret-gateway-agent/config.yaml"
-	// DefaultStateDir holds one state file and one stamp file per bundle.
-	DefaultStateDir = "/var/lib/kube-secret-gateway-agent"
-	// DefaultMetricsListenAddress makes the endpoint reachable by an external
-	// Prometheus server. Operators should restrict it with a host firewall.
+	DefaultPath                 = "/etc/kube-secret-gateway-agent/config.yaml"
+	DefaultStateDir             = "/var/lib/kube-secret-gateway-agent"
 	DefaultMetricsListenAddress = "0.0.0.0:9091"
 
-	// DefaultTimeout bounds one HTTP request to the gateway.
 	DefaultTimeout = 30 * time.Second
-	// MinTimeout and MaxTimeout bound gateway.timeout.
-	MinTimeout = time.Second
-	MaxTimeout = 10 * time.Minute
+	MinTimeout     = time.Second
+	MaxTimeout     = 10 * time.Minute
 
-	// DefaultInterval is used when a bundle does not set one.
 	DefaultInterval = 5 * time.Minute
-	// MinInterval and MaxInterval bound a bundle's interval. The gateway
-	// answers unchanged bundles with a bodyless 304, so polling is cheap, but
-	// very short intervals only add requests.
-	MinInterval = 10 * time.Second
-	MaxInterval = 7 * 24 * time.Hour
+	MinInterval     = 10 * time.Second
+	MaxInterval     = 7 * 24 * time.Hour
 
-	// DefaultFileMode is used for an installed file that sets no mode. Secret
-	// values are private by default.
 	DefaultFileMode fs.FileMode = 0o600
 )
 
@@ -70,19 +46,16 @@ func (e *Error) Error() string {
 
 // Config is a validated configuration.
 type Config struct {
-	Gateway  Gateway
-	Metrics  Metrics
-	Bundles  []Bundle
-	exposure map[string]Credentials
+	Gateway   Gateway
+	Metrics   Metrics
+	Exposures []Exposure
 }
 
 // Gateway is where and how to reach kube-secret-gateway.
 type Gateway struct {
-	// URL is the base URL, with any trailing slash removed. Bundle requests
-	// are made to URL + "/bundles/" + exposure.
-	URL *url.URL
-	// CAFile, when set, is the only certificate authority trusted for the
-	// gateway. Empty means the system pool.
+	// URL is the base URL, with any trailing slash removed. Exposure requests
+	// are made to URL + "/exposures/" + name.
+	URL     *url.URL
 	CAFile  string
 	Timeout time.Duration
 }
@@ -92,97 +65,40 @@ type Metrics struct {
 	ListenAddress string
 }
 
-// Credentials says where an exposure's Basic Auth credentials are read from.
-// The values themselves are never held in a Config.
-type Credentials struct {
-	Name     string
-	Username string
-	// Exactly one of the following is set.
-	CredentialsFile string // one line, "username:password"
-	PasswordFile    string // the password alone
-	PasswordEnv     string // the name of an environment variable
+// Auth locates one exposure's HTTP Basic Auth credentials.
+type Auth struct {
+	Username     string
+	PasswordFile string
 }
 
-// Bundle is one set of keys that is fetched, installed and reloaded together.
-// It maps to exactly one exposure, and therefore to one Kubernetes Secret, so
-// a fetch can never mix two versions of it.
-type Bundle struct {
-	Name     string
-	Exposure string
-	Interval time.Duration
-	// OnChangeCommand is run, without a shell, after the files of this bundle
-	// have been installed. Empty means nothing is run.
+// Resolve reads the password immediately before a request so rotation takes
+// effect without restarting the agent.
+func (a Auth) Resolve(exposureName string) (username, password string, err error) {
+	data, err := os.ReadFile(a.PasswordFile)
+	if err != nil {
+		return "", "", fmt.Errorf("exposure %q: passwordFile: %w", exposureName, err)
+	}
+	password = string(data)
+	if password == "" {
+		return "", "", fmt.Errorf("exposure %q: passwordFile %s is empty", exposureName, a.PasswordFile)
+	}
+	return a.Username, password, nil
+}
+
+// Exposure is one server exposure and its local synchronization lifecycle.
+type Exposure struct {
+	Name            string
+	Auth            Auth
+	Interval        time.Duration
 	OnChangeCommand []string
-	// Files are the keys to install, sorted by key.
-	Files []File
+	Targets         []Target
 }
 
-// File is one key of the bundle and where it is installed.
-type File struct {
+// Target is one exposure key and its absolute local destination.
+type Target struct {
 	Key  string
 	Path string
 	Mode fs.FileMode
-}
-
-// Credentials returns where to read the credentials of the exposure a bundle
-// uses. Validation guarantees that every bundle's exposure is declared.
-func (c *Config) Credentials(b Bundle) Credentials { return c.exposure[b.Exposure] }
-
-// PasswordEnvNames returns every environment variable that holds a password,
-// sorted. A command run after a change must not inherit them.
-func (c *Config) PasswordEnvNames() []string {
-	var names []string
-	for _, cr := range c.exposure {
-		if cr.PasswordEnv != "" && !slices.Contains(names, cr.PasswordEnv) {
-			names = append(names, cr.PasswordEnv)
-		}
-	}
-	slices.Sort(names)
-	return names
-}
-
-// Resolve reads the username and password from their source. It is called
-// before each fetch rather than at startup, so that a long-running process
-// does not keep passwords in memory between fetches, and so that a rotated
-// credentials file takes effect without a restart.
-func (c Credentials) Resolve() (username, password string, err error) {
-	switch {
-	case c.CredentialsFile != "":
-		data, err := os.ReadFile(c.CredentialsFile)
-		if err != nil {
-			return "", "", fmt.Errorf("exposure %q: credentialsFile: %w", c.Name, err)
-		}
-		line := strings.TrimRight(string(data), "\r\n")
-		user, pass, ok := strings.Cut(line, ":")
-		if !ok {
-			return "", "", fmt.Errorf("exposure %q: credentialsFile %s: want one line of \"username:password\"", c.Name, c.CredentialsFile)
-		}
-		if user == "" || pass == "" {
-			return "", "", fmt.Errorf("exposure %q: credentialsFile %s: username and password must both be set", c.Name, c.CredentialsFile)
-		}
-		return user, pass, nil
-	case c.PasswordFile != "":
-		data, err := os.ReadFile(c.PasswordFile)
-		if err != nil {
-			return "", "", fmt.Errorf("exposure %q: passwordFile: %w", c.Name, err)
-		}
-		// A trailing newline is stripped: editors add one, and the gateway
-		// compares the password exactly.
-		pass := strings.TrimRight(string(data), "\r\n")
-		if pass == "" {
-			return "", "", fmt.Errorf("exposure %q: passwordFile %s is empty", c.Name, c.PasswordFile)
-		}
-		return c.Username, pass, nil
-	default:
-		pass, ok := os.LookupEnv(c.PasswordEnv)
-		if !ok {
-			return "", "", fmt.Errorf("exposure %q: %s is not set in the environment", c.Name, c.PasswordEnv)
-		}
-		if pass == "" {
-			return "", "", fmt.Errorf("exposure %q: %s is empty", c.Name, c.PasswordEnv)
-		}
-		return c.Username, pass, nil
-	}
 }
 
 // Load reads and validates the configuration file at path.
@@ -194,8 +110,7 @@ func Load(path string) (*Config, error) {
 	return Parse(data)
 }
 
-// Parse validates one YAML document. Unknown fields are errors, so a typo
-// never silently disables something.
+// Parse validates one YAML document. Unknown fields are errors.
 func Parse(data []byte) (*Config, error) {
 	var doc document
 	dec := yaml.NewDecoder(bytes.NewReader(data))
@@ -217,13 +132,10 @@ func Parse(data []byte) (*Config, error) {
 	return doc.resolve()
 }
 
-// The YAML shape. It exists only to be decoded; resolve turns it into a
-// Config and is the only place that reports problems.
 type document struct {
 	Gateway   gatewayDoc    `yaml:"gateway"`
 	Metrics   metricsDoc    `yaml:"metrics"`
 	Exposures []exposureDoc `yaml:"exposures"`
-	Bundles   []bundleDoc   `yaml:"bundles"`
 }
 
 type gatewayDoc struct {
@@ -237,61 +149,36 @@ type metricsDoc struct {
 }
 
 type exposureDoc struct {
-	Name            string `yaml:"name"`
-	Username        string `yaml:"username"`
-	CredentialsFile string `yaml:"credentialsFile"`
-	PasswordFile    string `yaml:"passwordFile"`
-	PasswordEnv     string `yaml:"passwordEnv"`
+	Name            string      `yaml:"name"`
+	Auth            *authDoc    `yaml:"auth"`
+	Interval        string      `yaml:"interval"`
+	Targets         []targetDoc `yaml:"targets"`
+	OnChangeCommand []string    `yaml:"onChangeCommand"`
 }
 
-type bundleDoc struct {
-	Name            string             `yaml:"name"`
-	Exposure        string             `yaml:"exposure"`
-	Interval        string             `yaml:"interval"`
-	OnChangeCommand []string           `yaml:"onChangeCommand"`
-	Files           map[string]fileDoc `yaml:"files"`
+type authDoc struct {
+	Username     string `yaml:"username"`
+	PasswordFile string `yaml:"passwordFile"`
 }
 
-// fileDoc accepts either a path on its own or a mapping with a mode, so the
-// common case stays a single line.
-type fileDoc struct {
+type targetDoc struct {
+	Key  string `yaml:"key"`
 	Path string `yaml:"path"`
 	Mode string `yaml:"mode"`
 }
 
-func (f *fileDoc) UnmarshalYAML(node *yaml.Node) error {
-	if node.Kind == yaml.ScalarNode {
-		return node.Decode(&f.Path)
-	}
-	type raw fileDoc // avoids recursing into this method
-	var r raw
-	if err := node.Decode(&r); err != nil {
-		return err
-	}
-	*f = fileDoc(r)
-	return nil
-}
+const dns1123LabelPattern = `[a-z0-9]([-a-z0-9]*[a-z0-9])?`
 
-// Exposure and Secret key names are restricted by the gateway, which rejects
-// anything else with a 404. Checking here turns a silent 404 into a startup
-// error, and guarantees that no name needs percent-encoding in a URL.
 var (
-	nameRE = regexp.MustCompile(`^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$`)
+	nameRE = regexp.MustCompile(`^` + dns1123LabelPattern + `(\.` + dns1123LabelPattern + `)*$`)
 	keyRE  = regexp.MustCompile(`^[-._a-zA-Z0-9]+$`)
-	// A bundle name is also a file name in the state directory.
-	bundleNameRE = regexp.MustCompile(`^[a-zA-Z0-9]([-_a-zA-Z0-9.]*[a-zA-Z0-9])?$`)
 )
 
 func (d *document) resolve() (*Config, error) {
 	var problems []string
 	add := func(format string, args ...any) { problems = append(problems, fmt.Sprintf(format, args...)) }
+	cfg := &Config{Metrics: Metrics{ListenAddress: DefaultMetricsListenAddress}}
 
-	cfg := &Config{
-		Metrics:  Metrics{ListenAddress: DefaultMetricsListenAddress},
-		exposure: make(map[string]Credentials, len(d.Exposures)),
-	}
-
-	// gateway
 	switch {
 	case d.Gateway.URL == "":
 		add("gateway.url is required")
@@ -324,7 +211,6 @@ func (d *document) resolve() (*Config, error) {
 		}
 	}
 
-	// metrics
 	if d.Metrics.ListenAddress != nil {
 		cfg.Metrics.ListenAddress = *d.Metrics.ListenAddress
 	}
@@ -332,144 +218,108 @@ func (d *document) resolve() (*Config, error) {
 		add("metrics.listenAddress: %v", err)
 	}
 
-	// exposures
 	if len(d.Exposures) == 0 {
 		add("exposures must list at least one exposure")
 	}
-	for i, e := range d.Exposures {
+	seenName := make(map[string]int, len(d.Exposures))
+	seenPath := make(map[string]string)
+	for i, raw := range d.Exposures {
 		where := fmt.Sprintf("exposures[%d]", i)
+		e := Exposure{Name: raw.Name, Interval: DefaultInterval}
 		switch {
-		case e.Name == "":
+		case raw.Name == "":
 			add("%s: name is required", where)
-		case !nameRE.MatchString(e.Name) || len(e.Name) > 253:
-			add("%s: name %q is not a valid exposure name", where, e.Name)
+		case !nameRE.MatchString(raw.Name) || len(raw.Name) > 253:
+			add("%s: name %q is not a valid exposure name", where, raw.Name)
 		default:
-			where = fmt.Sprintf("exposure %q", e.Name)
-			if _, dup := cfg.exposure[e.Name]; dup {
-				add("%s: duplicate name", where)
-				continue
-			}
-		}
-
-		sources := 0
-		for _, set := range []bool{e.CredentialsFile != "", e.PasswordFile != "", e.PasswordEnv != ""} {
-			if set {
-				sources++
-			}
-		}
-		switch {
-		case sources == 0:
-			add("%s: one of credentialsFile, passwordFile or passwordEnv is required", where)
-		case sources > 1:
-			add("%s: credentialsFile, passwordFile and passwordEnv are mutually exclusive", where)
-		}
-		if e.CredentialsFile != "" && e.Username != "" {
-			add("%s: username belongs in the credentialsFile, not in the configuration", where)
-		}
-		if e.CredentialsFile == "" && e.Username == "" && sources > 0 {
-			add("%s: username is required unless credentialsFile is used", where)
-		}
-		for field, path := range map[string]string{"credentialsFile": e.CredentialsFile, "passwordFile": e.PasswordFile} {
-			if path != "" && !strings.HasPrefix(path, "/") {
-				add("%s: %s %q must be an absolute path", where, field, path)
-			}
-		}
-		if e.Name != "" {
-			cfg.exposure[e.Name] = Credentials{
-				Name:            e.Name,
-				Username:        e.Username,
-				CredentialsFile: e.CredentialsFile,
-				PasswordFile:    e.PasswordFile,
-				PasswordEnv:     e.PasswordEnv,
-			}
-		}
-	}
-
-	// bundles
-	if len(d.Bundles) == 0 {
-		add("bundles must list at least one bundle")
-	}
-	seenBundle := make(map[string]struct{}, len(d.Bundles))
-	seenPath := make(map[string]string, len(d.Bundles))
-	for i, b := range d.Bundles {
-		where := fmt.Sprintf("bundles[%d]", i)
-		switch {
-		case b.Name == "":
-			add("%s: name is required", where)
-		case !bundleNameRE.MatchString(b.Name) || len(b.Name) > 100:
-			add("%s: name %q is not a valid bundle name", where, b.Name)
-		default:
-			where = fmt.Sprintf("bundle %q", b.Name)
-			if _, dup := seenBundle[b.Name]; dup {
-				add("%s: duplicate name", where)
-				continue
-			}
-			seenBundle[b.Name] = struct{}{}
-		}
-
-		bundle := Bundle{Name: b.Name, Exposure: b.Exposure, Interval: DefaultInterval}
-		switch {
-		case b.Exposure == "":
-			add("%s: exposure is required", where)
-		case len(d.Exposures) > 0:
-			if _, ok := cfg.exposure[b.Exposure]; !ok {
-				add("%s: exposure %q is not declared under exposures", where, b.Exposure)
-			}
-		}
-		if b.Interval != "" {
-			switch interval, err := time.ParseDuration(b.Interval); {
-			case err != nil:
-				add("%s: interval %q: %v", where, b.Interval, err)
-			case interval < MinInterval || interval > MaxInterval:
-				add("%s: interval %s is outside %s..%s", where, interval, MinInterval, MaxInterval)
-			default:
-				bundle.Interval = interval
-			}
-		}
-		if b.OnChangeCommand != nil {
-			if len(b.OnChangeCommand) == 0 || b.OnChangeCommand[0] == "" {
-				add("%s: onChangeCommand must start with a command to run", where)
+			if j, dup := seenName[raw.Name]; dup {
+				add("%s: duplicate exposure name %q (already used by exposures[%d])", where, raw.Name, j)
 			} else {
-				bundle.OnChangeCommand = slices.Clone(b.OnChangeCommand)
+				seenName[raw.Name] = i
 			}
 		}
-		if len(b.Files) == 0 {
-			add("%s: files must map at least one Secret key to a path", where)
-		}
-		for _, key := range slices.Sorted(maps.Keys(b.Files)) {
-			f := b.Files[key]
-			if !keyRE.MatchString(key) {
-				add("%s: %q is not a valid Secret key", where, key)
-				continue
+
+		if raw.Auth == nil {
+			add("%s.auth: required", where)
+		} else {
+			e.Auth = Auth{Username: raw.Auth.Username, PasswordFile: raw.Auth.PasswordFile}
+			if raw.Auth.Username == "" {
+				add("%s.auth.username: required", where)
 			}
-			file := File{Key: key, Path: f.Path, Mode: DefaultFileMode}
 			switch {
-			case f.Path == "":
-				add("%s: key %q has no path", where, key)
-			case !strings.HasPrefix(f.Path, "/"):
-				add("%s: key %q: path %q must be absolute", where, key, f.Path)
-			case strings.HasSuffix(f.Path, "/"):
-				add("%s: key %q: path %q must name a file, not a directory", where, key, f.Path)
-			default:
-				if owner, dup := seenPath[f.Path]; dup {
-					add("%s: key %q: path %q is already installed by %s", where, key, f.Path, owner)
-					continue
-				}
-				seenPath[f.Path] = fmt.Sprintf("bundle %q", b.Name)
+			case raw.Auth.PasswordFile == "":
+				add("%s.auth.passwordFile: required", where)
+			case !filepath.IsAbs(raw.Auth.PasswordFile):
+				add("%s.auth.passwordFile: %q must be an absolute path", where, raw.Auth.PasswordFile)
 			}
-			if f.Mode != "" {
-				switch mode, err := strconv.ParseUint(f.Mode, 8, 32); {
-				case err != nil || !strings.HasPrefix(f.Mode, "0"):
-					add("%s: key %q: mode %q must be octal and start with 0, such as \"0640\"", where, key, f.Mode)
-				case mode&^0o777 != 0:
-					add("%s: key %q: mode %q must not set bits outside 0777", where, key, f.Mode)
-				default:
-					file.Mode = fs.FileMode(mode)
-				}
-			}
-			bundle.Files = append(bundle.Files, file)
 		}
-		cfg.Bundles = append(cfg.Bundles, bundle)
+
+		if raw.Interval != "" {
+			switch interval, err := time.ParseDuration(raw.Interval); {
+			case err != nil:
+				add("%s.interval %q: %v", where, raw.Interval, err)
+			case interval < MinInterval || interval > MaxInterval:
+				add("%s.interval %s is outside %s..%s", where, interval, MinInterval, MaxInterval)
+			default:
+				e.Interval = interval
+			}
+		}
+		if raw.OnChangeCommand != nil {
+			if len(raw.OnChangeCommand) == 0 || raw.OnChangeCommand[0] == "" {
+				add("%s.onChangeCommand must start with a command to run", where)
+			} else {
+				e.OnChangeCommand = append([]string(nil), raw.OnChangeCommand...)
+			}
+		}
+
+		if len(raw.Targets) == 0 {
+			add("%s.targets: at least one target is required", where)
+		}
+		seenKey := make(map[string]int, len(raw.Targets))
+		for j, target := range raw.Targets {
+			targetWhere := fmt.Sprintf("%s.targets[%d]", where, j)
+			t := Target{Key: target.Key, Mode: DefaultFileMode}
+			switch {
+			case target.Key == "":
+				add("%s.key: required", targetWhere)
+			case !keyRE.MatchString(target.Key):
+				add("%s.key: %q is not a valid Secret key", targetWhere, target.Key)
+			default:
+				if first, dup := seenKey[target.Key]; dup {
+					add("%s.key: duplicate key %q (already used by %s.targets[%d])", targetWhere, target.Key, where, first)
+				} else {
+					seenKey[target.Key] = j
+				}
+			}
+			switch {
+			case target.Path == "":
+				add("%s.path: required", targetWhere)
+			case !filepath.IsAbs(target.Path):
+				add("%s.path: %q must be absolute", targetWhere, target.Path)
+			case strings.HasSuffix(target.Path, string(filepath.Separator)):
+				add("%s.path: %q must name a file, not a directory", targetWhere, target.Path)
+			default:
+				cleanPath := filepath.Clean(target.Path)
+				t.Path = cleanPath
+				if owner, dup := seenPath[cleanPath]; dup {
+					add("%s.path: %q normalizes to %q, already installed by %s", targetWhere, target.Path, cleanPath, owner)
+				} else {
+					seenPath[cleanPath] = targetWhere
+				}
+			}
+			if target.Mode != "" {
+				switch mode, err := strconv.ParseUint(target.Mode, 8, 32); {
+				case err != nil || !strings.HasPrefix(target.Mode, "0"):
+					add("%s.mode: %q must be octal and start with 0, such as \"0640\"", targetWhere, target.Mode)
+				case mode&^0o777 != 0:
+					add("%s.mode: %q must not set bits outside 0777", targetWhere, target.Mode)
+				default:
+					t.Mode = fs.FileMode(mode)
+				}
+			}
+			e.Targets = append(e.Targets, t)
+		}
+		cfg.Exposures = append(cfg.Exposures, e)
 	}
 
 	if len(problems) > 0 {

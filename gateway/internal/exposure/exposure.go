@@ -3,10 +3,7 @@
 // and protected by an allow-list of client networks and an authentication
 // Secret.
 //
-// The model carries no YAML, HTTP or client-go concerns. The YAML loader in
-// package config is one producer of []Exposure; another source (a custom
-// resource, for example) could produce the same values without changes to the
-// HTTP, authentication, resource watching or metrics layers.
+// The model carries no YAML, HTTP or client-go concerns.
 package exposure
 
 import (
@@ -34,22 +31,14 @@ func (r SecretRef) Compare(o SecretRef) int {
 	return cmp.Or(cmp.Compare(r.Namespace, o.Namespace), cmp.Compare(r.Name, o.Name))
 }
 
-// AuthType selects how clients of an exposure authenticate.
-type AuthType string
-
-// AuthBasic is HTTP Basic authentication against the "username" and
-// "password" keys of a Kubernetes Secret.
-const AuthBasic AuthType = "basicAuth"
-
-// Auth describes how clients of an exposure authenticate. Credentials always
-// live in a Kubernetes Secret, never in configuration.
+// Auth identifies the Kubernetes Secret holding the exposure's HTTP Basic
+// Auth credentials. It must contain non-empty "username" and "password" keys.
 type Auth struct {
-	Type      AuthType
 	SecretRef SecretRef
 }
 
-// Exposure is one HTTP exposure: GET /secrets/{Name}/{key} serves key from
-// the Source Secret, subject to Keys, AllowedCIDRs and Auth.
+// Exposure is one remotely addressable projection of explicitly selected keys
+// from one Kubernetes Secret.
 type Exposure struct {
 	// Name is the URL path segment. It is independent of the Secret's
 	// namespace, which never appears in URLs.
@@ -57,7 +46,7 @@ type Exposure struct {
 	Source       SecretRef
 	AllowedCIDRs []netip.Prefix
 	Auth         Auth
-	Keys         KeyFilter
+	Keys         []string
 }
 
 // AllowsClient reports whether addr is inside one of the allowed networks.
@@ -87,70 +76,6 @@ func ReferencedSecrets(exposures []Exposure) []SecretRef {
 	}
 	slices.SortFunc(refs, SecretRef.Compare)
 	return refs
-}
-
-type keyMode uint8
-
-const (
-	allKeys keyMode = iota
-	includeKeys
-	excludeKeys
-)
-
-// KeyFilter decides which keys of the backing Secret an exposure serves. The
-// zero value serves every key.
-type KeyFilter struct {
-	mode keyMode
-	set  map[string]struct{}
-	list []string
-}
-
-// IncludeKeys returns a filter that serves only keys, and treats each of them
-// as required: a missing included key is an operational failure rather than
-// an ordinary "not found". Duplicates are ignored.
-func IncludeKeys(keys ...string) KeyFilter { return newKeyFilter(includeKeys, keys) }
-
-// ExcludeKeys returns a filter that serves every key except keys, which behave
-// as if they did not exist. Duplicates are ignored.
-func ExcludeKeys(keys ...string) KeyFilter { return newKeyFilter(excludeKeys, keys) }
-
-func newKeyFilter(mode keyMode, keys []string) KeyFilter {
-	f := KeyFilter{mode: mode, set: make(map[string]struct{}, len(keys))}
-	for _, k := range keys {
-		if _, dup := f.set[k]; dup {
-			continue
-		}
-		f.set[k] = struct{}{}
-		f.list = append(f.list, k)
-	}
-	return f
-}
-
-// Exposes reports whether key may be served through the exposure.
-func (f KeyFilter) Exposes(key string) bool {
-	_, listed := f.set[key]
-	switch f.mode {
-	case includeKeys:
-		return listed
-	case excludeKeys:
-		return !listed
-	default:
-		return true
-	}
-}
-
-// Required reports whether key is explicitly expected to exist.
-func (f KeyFilter) Required(key string) bool {
-	_, listed := f.set[key]
-	return f.mode == includeKeys && listed
-}
-
-// RequiredKeys returns the explicitly expected keys in configuration order.
-func (f KeyFilter) RequiredKeys() []string {
-	if f.mode != includeKeys {
-		return nil
-	}
-	return slices.Clone(f.list)
 }
 
 // ValidateName checks an exposure name. Names follow Kubernetes object naming

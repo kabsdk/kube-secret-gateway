@@ -18,11 +18,16 @@ import (
 // setup starts a fake gateway and writes an agent configuration for it. It returns
 // the configuration path, the directory files are installed into, and the
 // gateway.
-func setup(t *testing.T, bundles string) (configPath, installDir string, gw *gwtest.Gateway) {
+func setup(t *testing.T, exposures string) (configPath, installDir string, gw *gwtest.Gateway) {
 	t.Helper()
 	gw = gwtest.New()
 	t.Cleanup(gw.Close)
 	gw.Set("my-cert", gwtest.Exposure{
+		Username: "fetcher",
+		Password: "hunter2",
+		Values:   map[string][]byte{"tls.crt": []byte("CERT"), "tls.key": []byte("KEY")},
+	})
+	gw.Set("other", gwtest.Exposure{
 		Username: "fetcher",
 		Password: "hunter2",
 		Values:   map[string][]byte{"tls.crt": []byte("CERT"), "tls.key": []byte("KEY")},
@@ -34,19 +39,24 @@ func setup(t *testing.T, bundles string) (configPath, installDir string, gw *gwt
 		t.Fatal(err)
 	}
 	passwordFile := filepath.Join(root, "password")
-	if err := os.WriteFile(passwordFile, []byte("hunter2\n"), 0o600); err != nil {
+	if err := os.WriteFile(passwordFile, []byte("hunter2"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if bundles == "" {
-		bundles = fmt.Sprintf(`
-  - name: nginx-tls
-    exposure: my-cert
-    files:
-      tls.crt: %s/tls.crt
-      tls.key: %s/tls.key
-`, installDir, installDir)
+	if exposures == "" {
+		exposures = fmt.Sprintf(`
+  - name: my-cert
+    auth:
+      username: fetcher
+      passwordFile: %s
+    targets:
+      - key: tls.crt
+        path: %s/tls.crt
+      - key: tls.key
+        path: %s/tls.key
+`, passwordFile, installDir, installDir)
 	} else {
-		bundles = strings.ReplaceAll(bundles, "$DIR", installDir)
+		exposures = strings.ReplaceAll(exposures, "$DIR", installDir)
+		exposures = strings.ReplaceAll(exposures, "$PASSWORD", passwordFile)
 	}
 
 	configPath = filepath.Join(root, "config.yaml")
@@ -56,10 +66,7 @@ gateway:
 metrics:
   listenAddress: "127.0.0.1:0"
 exposures:
-  - name: my-cert
-    username: fetcher
-    passwordFile: %s
-bundles:%s`, gw.URL(), passwordFile, bundles)
+%s`, gw.URL(), exposures)
 	if err := os.WriteFile(configPath, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +115,7 @@ func TestOnceInstallsAndExitsZero(t *testing.T) {
 	}
 }
 
-func TestOnceReturnsOneWhenABundleFails(t *testing.T) {
+func TestOnceReturnsOneWhenAnExposureFails(t *testing.T) {
 	configPath, dir, gw := setup(t, "")
 	gw.SetStatus("my-cert", 503)
 	code, stderr := exec(t, context.Background(), "-config", configPath, "-state-dir", filepath.Join(t.TempDir(), "state"), "-once")
@@ -120,37 +127,43 @@ func TestOnceReturnsOneWhenABundleFails(t *testing.T) {
 	}
 }
 
-func TestBundleSelection(t *testing.T) {
-	bundles := `
-  - name: nginx-tls
-    exposure: my-cert
-    files:
-      tls.crt: $DIR/tls.crt
+func TestExposureSelection(t *testing.T) {
+	exposures := `
+  - name: my-cert
+    auth:
+      username: fetcher
+      passwordFile: $PASSWORD
+    targets:
+      - key: tls.crt
+        path: $DIR/tls.crt
   - name: other
-    exposure: my-cert
-    files:
-      tls.key: $DIR/tls.key
+    auth:
+      username: fetcher
+      passwordFile: $PASSWORD
+    targets:
+      - key: tls.key
+        path: $DIR/tls.key
 `
-	configPath, dir, _ := setup(t, bundles)
+	configPath, dir, _ := setup(t, exposures)
 	stateDir := filepath.Join(t.TempDir(), "state")
 
-	code, stderr := exec(t, context.Background(), "-config", configPath, "-state-dir", stateDir, "-once", "-bundle", "other")
+	code, stderr := exec(t, context.Background(), "-config", configPath, "-state-dir", stateDir, "-once", "-exposure", "other")
 	if code != 0 {
 		t.Fatalf("exit code %d\n%s", code, stderr)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "tls.key")); err != nil {
-		t.Fatalf("the selected bundle was not installed: %v", err)
+		t.Fatalf("the selected exposure was not installed: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "tls.crt")); !os.IsNotExist(err) {
-		t.Fatal("an unselected bundle was installed")
+		t.Fatal("an unselected exposure was installed")
 	}
 
-	code, stderr = exec(t, context.Background(), "-config", configPath, "-state-dir", stateDir, "-once", "-bundle", "nope")
+	code, stderr = exec(t, context.Background(), "-config", configPath, "-state-dir", stateDir, "-once", "-exposure", "nope")
 	if code != 2 {
 		t.Fatalf("exit code %d, want 2", code)
 	}
 	// The message says what is configured, so a typo is easy to fix.
-	for _, want := range []string{"no such bundle: nope", "nginx-tls", "other"} {
+	for _, want := range []string{"no such exposure: nope", "my-cert", "other"} {
 		if !strings.Contains(stderr, want) {
 			t.Fatalf("stderr %q does not mention %q", stderr, want)
 		}
@@ -281,14 +294,14 @@ func TestDaemonStopsOnCancellation(t *testing.T) {
 					t.Fatal(readErr)
 				}
 				if resp.StatusCode == http.StatusOK && strings.Contains(string(body),
-					`kube_secret_gateway_agent_sync_attempts_total{bundle="nginx-tls"} 1`) {
+					`kube_secret_gateway_agent_sync_attempts_total{exposure="my-cert"} 1`) {
 					break
 				}
 			}
 		}
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatal("the daemon never installed the bundle")
+			t.Fatal("the daemon never installed the exposure")
 		}
 		time.Sleep(5 * time.Millisecond)
 	}

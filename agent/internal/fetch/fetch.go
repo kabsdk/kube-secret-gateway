@@ -1,11 +1,10 @@
-// Package fetch installs bundles and keeps them up to date.
+// Package fetch installs exposures and keeps them up to date.
 //
-// One bundle is one exposure, so one HTTP request returns every value it
-// contains from one version of the Secret. That is the whole reason a bundle
-// exists: a certificate and its private key are never downloaded from two
-// different versions.
+// One request returns every value in an exposure from one version of its
+// Kubernetes Secret, so a certificate and its private key are never downloaded
+// from different versions.
 //
-// Within a bundle the same care is taken locally. Every file is written to a
+// Within an exposure the same care is taken locally. Every file is written to a
 // temporary file next to its destination and flushed to disk first; only then
 // are the temporary files renamed into place, one rename per file, with no
 // download or fsync in between. A crash can therefore leave at most a few
@@ -52,17 +51,17 @@ type Options struct {
 	Observer       Observer
 }
 
-// Observer receives one event after every bundle synchronization attempt.
-// Implementations must be safe for concurrent calls from different bundles.
+// Observer receives one event after every exposure synchronization attempt.
+// Implementations must be safe for concurrent calls from different exposures.
 type Observer interface {
-	ObserveSync(bundle string, changed bool, err error, duration time.Duration)
+	ObserveSync(exposure string, changed bool, err error, duration time.Duration)
 }
 
 type discardObserver struct{}
 
 func (discardObserver) ObserveSync(string, bool, error, time.Duration) {}
 
-// Runner syncs the bundles of one configuration.
+// Runner syncs the exposures of one configuration.
 type Runner struct {
 	cfg      *config.Config
 	client   *gateway.Client
@@ -70,9 +69,6 @@ type Runner struct {
 	log      *slog.Logger
 	timeout  time.Duration
 	observer Observer
-	// env is the environment for onChangeCommand: this process's, without any
-	// variable that holds a password.
-	env []string
 }
 
 // NewRunner returns a Runner. The state directory is created if it is missing.
@@ -98,67 +94,53 @@ func NewRunner(cfg *config.Config, opts Options) (*Runner, error) {
 		log:      opts.Logger,
 		timeout:  timeout,
 		observer: observer,
-		env:      scrubbed(os.Environ(), cfg.PasswordEnvNames()),
 	}, nil
 }
 
-// scrubbed removes the named variables. A command run after a change has no
-// business seeing a password, and would pass it on to anything it starts.
-func scrubbed(env, remove []string) []string {
-	out := make([]string, 0, len(env))
-	for _, kv := range env {
-		name, _, _ := strings.Cut(kv, "=")
-		if !slices.Contains(remove, name) {
-			out = append(out, kv)
-		}
-	}
-	return out
-}
-
-// Once syncs every bundle in turn and returns the problems it hit. Every
-// bundle is attempted even if an earlier one failed, so one broken exposure
+// Once syncs every exposure in turn and returns the problems it hit. Every
+// exposure is attempted even if an earlier one failed, so one broken exposure
 // does not hide the state of the others.
 func (r *Runner) Once(ctx context.Context) error {
 	var errs []error
-	for _, b := range r.cfg.Bundles {
+	for _, e := range r.cfg.Exposures {
 		if err := ctx.Err(); err != nil {
 			return errors.Join(append(errs, err)...)
 		}
-		if _, err := r.Sync(ctx, b); err != nil {
-			r.log.Error("sync failed", "bundle", b.Name, "error", err)
+		if _, err := r.Sync(ctx, e); err != nil {
+			r.log.Error("sync failed", "exposure", e.Name, "error", err)
 			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
 }
 
-// Serve syncs each bundle on its own interval until ctx is cancelled. A bundle
-// that fails is logged and retried on its next tick: one unreachable exposure
-// never stops the others. Serve returns when every bundle has stopped.
+// Serve syncs each exposure on its own interval until ctx is cancelled. A
+// failure is logged and retried on its next tick; one unreachable exposure
+// never stops the others. Serve returns when every exposure has stopped.
 func (r *Runner) Serve(ctx context.Context) {
 	var wg sync.WaitGroup
-	for _, b := range r.cfg.Bundles {
+	for _, e := range r.cfg.Exposures {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			r.serveBundle(ctx, b)
+			r.serveExposure(ctx, e)
 		}()
 	}
 	wg.Wait()
 }
 
-func (r *Runner) serveBundle(ctx context.Context, b config.Bundle) {
-	log := r.log.With("bundle", b.Name)
-	log.Info("watching", "exposure", b.Exposure, "interval", b.Interval, "files", len(b.Files))
+func (r *Runner) serveExposure(ctx context.Context, e config.Exposure) {
+	log := r.log.With("exposure", e.Name)
+	log.Info("watching", "interval", e.Interval, "targets", len(e.Targets))
 	for {
-		if _, err := r.Sync(ctx, b); err != nil && ctx.Err() == nil {
-			log.Error("sync failed, will retry", "error", err, "retry_in", b.Interval)
+		if _, err := r.Sync(ctx, e); err != nil && ctx.Err() == nil {
+			log.Error("sync failed, will retry", "error", err, "retry_in", e.Interval)
 		}
 		// Jitter spreads the polling of many hosts that were configured and
 		// started together, so they do not all ask at the same instant.
-		wait := b.Interval
-		if window := b.Interval / 10; window > 0 {
-			wait = b.Interval - window/2 + rand.N(window)
+		wait := e.Interval
+		if window := e.Interval / 10; window > 0 {
+			wait = e.Interval - window/2 + rand.N(window)
 		}
 		select {
 		case <-ctx.Done():
@@ -169,25 +151,25 @@ func (r *Runner) serveBundle(ctx context.Context, b config.Bundle) {
 	}
 }
 
-// Sync fetches one bundle and installs it if anything changed. It reports
+// Sync fetches one exposure and installs its targets if anything changed. It reports
 // whether files were written.
-func (r *Runner) Sync(ctx context.Context, b config.Bundle) (changed bool, err error) {
+func (r *Runner) Sync(ctx context.Context, e config.Exposure) (changed bool, err error) {
 	started := time.Now()
-	defer func() { r.observer.ObserveSync(b.Name, changed, err, time.Since(started)) }()
+	defer func() { r.observer.ObserveSync(e.Name, changed, err, time.Since(started)) }()
 
-	log := r.log.With("bundle", b.Name)
+	log := r.log.With("exposure", e.Name)
 
-	username, password, err := r.cfg.Credentials(b).Resolve()
+	username, password, err := e.Auth.Resolve(e.Name)
 	if err != nil {
 		return false, err
 	}
 
-	etag, err := r.currentETag(b)
+	etag, err := r.currentETag(e)
 	if err != nil {
 		return false, err
 	}
 
-	bundle, err := r.client.Fetch(ctx, b.Exposure, etag, username, password)
+	result, err := r.client.Fetch(ctx, e.Name, etag, username, password)
 	switch {
 	case errors.Is(err, gateway.ErrNotModified):
 		log.Debug("unchanged")
@@ -196,38 +178,36 @@ func (r *Runner) Sync(ctx context.Context, b config.Bundle) (changed bool, err e
 		return false, err
 	}
 
-	// Every configured key must be in the response. A bundle contains what
-	// the exposure serves, which includeKeys and excludeKeys decide, so a
-	// missing key is a configuration mismatch, not a transient failure.
+	// Every target key must be in the response before any files are changed.
 	var missing []string
-	for _, f := range b.Files {
-		if _, ok := bundle.Values[f.Key]; !ok {
-			missing = append(missing, f.Key)
+	for _, target := range e.Targets {
+		if _, ok := result.Values[target.Key]; !ok {
+			missing = append(missing, target.Key)
 		}
 	}
 	if len(missing) > 0 {
-		return false, fmt.Errorf("bundle %q: exposure %q does not serve %s (it serves %s)",
-			b.Name, b.Exposure, strings.Join(missing, ", "), strings.Join(slices.Sorted(maps.Keys(bundle.Values)), ", "))
+		return false, fmt.Errorf("exposure %q does not contain target key(s) %s (it contains %s)",
+			e.Name, strings.Join(missing, ", "), strings.Join(slices.Sorted(maps.Keys(result.Values)), ", "))
 	}
 
-	if err := install(b.Files, bundle.Values); err != nil {
-		return false, fmt.Errorf("bundle %q: %w", b.Name, err)
+	if err := install(e.Targets, result.Values); err != nil {
+		return false, fmt.Errorf("exposure %q: %w", e.Name, err)
 	}
-	if err := touchStamp(r.stampPath(b)); err != nil {
-		return true, fmt.Errorf("bundle %q: writing the stamp file: %w", b.Name, err)
+	if err := touchStamp(r.stampPath(e)); err != nil {
+		return true, fmt.Errorf("exposure %q: writing the stamp file: %w", e.Name, err)
 	}
-	log.Info("installed", "exposure", b.Exposure, "files", len(b.Files))
+	log.Info("installed", "targets", len(e.Targets))
 
-	if len(b.OnChangeCommand) > 0 {
-		if err := r.runCommand(ctx, b); err != nil {
+	if len(e.OnChangeCommand) > 0 {
+		if err := r.runCommand(ctx, e); err != nil {
 			return true, err
 		}
 	}
 	// The ETag commits the complete sync, including onChangeCommand. Keeping
 	// the old tag when the command fails makes the next poll fetch and retry
 	// instead of accepting a 304 and silently leaving the consumer stale.
-	if err := writeFile(r.etagPath(b), []byte(bundle.ETag+"\n"), 0o600); err != nil {
-		return true, fmt.Errorf("bundle %q: recording the ETag: %w", b.Name, err)
+	if err := writeFile(r.etagPath(e), []byte(result.ETag+"\n"), 0o600); err != nil {
+		return true, fmt.Errorf("exposure %q: recording the ETag: %w", e.Name, err)
 	}
 
 	return true, nil
@@ -236,39 +216,39 @@ func (r *Runner) Sync(ctx context.Context, b config.Bundle) (changed bool, err e
 // currentETag is the stored tag, or "" to fetch unconditionally. The tag
 // describes files on disk, so it is only trusted while every one of them is
 // present with the mode the configuration asks for. A deleted or chmod-ed file
-// therefore reinstalls the whole bundle rather than being left alone.
-func (r *Runner) currentETag(b config.Bundle) (string, error) {
-	for _, f := range b.Files {
+// therefore reinstalls every target rather than being left alone.
+func (r *Runner) currentETag(e config.Exposure) (string, error) {
+	for _, f := range e.Targets {
 		info, err := os.Stat(f.Path)
 		switch {
 		case errors.Is(err, fs.ErrNotExist):
 			return "", nil
 		case err != nil:
-			return "", fmt.Errorf("bundle %q: %s: %w", b.Name, f.Path, err)
+			return "", fmt.Errorf("exposure %q: %s: %w", e.Name, f.Path, err)
 		case info.Mode().Perm() != f.Mode:
 			return "", nil
 		}
 	}
-	data, err := os.ReadFile(r.etagPath(b))
+	data, err := os.ReadFile(r.etagPath(e))
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		return "", nil
 	case err != nil:
-		return "", fmt.Errorf("bundle %q: reading the stored ETag: %w", b.Name, err)
+		return "", fmt.Errorf("exposure %q: reading the stored ETag: %w", e.Name, err)
 	}
 	return strings.TrimSpace(string(data)), nil
 }
 
-func (r *Runner) etagPath(b config.Bundle) string {
-	return filepath.Join(r.stateDir, b.Name+".etag")
+func (r *Runner) etagPath(e config.Exposure) string {
+	return filepath.Join(r.stateDir, e.Name+".etag")
 }
 
 // stampPath is touched after every change. It gives systemd a single file to
 // watch with a .path unit, which is the safe trigger: watching the installed
 // files themselves fires once per file, so a reload can run between the
 // certificate and the key.
-func (r *Runner) stampPath(b config.Bundle) string {
-	return filepath.Join(r.stateDir, b.Name+".stamp")
+func (r *Runner) stampPath(e config.Exposure) string {
+	return filepath.Join(r.stateDir, e.Name+".stamp")
 }
 
 // touchStamp writes the stamp file in place rather than renaming one over it.
@@ -287,11 +267,11 @@ func touchStamp(path string) error {
 	return err
 }
 
-// install writes every file of a bundle, then renames them into place. Nothing
+// install writes every target, then renames them into place. Nothing
 // is renamed until every temporary file has been written and flushed. Each
 // rename is atomic, but the sequence of renames is not a filesystem
 // transaction; the caller commits the ETag only after the sequence completes.
-func install(files []config.File, values map[string][]byte) error {
+func install(files []config.Target, values map[string][]byte) error {
 	temps := make([]string, 0, len(files))
 	defer func() {
 		// Anything still listed here was not renamed: remove it.
@@ -370,30 +350,29 @@ func writeFile(path string, data []byte, mode fs.FileMode) error {
 	return nil
 }
 
-// runCommand runs a bundle's onChangeCommand without a shell. The command and
+// runCommand runs an exposure's onChangeCommand without a shell. The command and
 // its arguments come from the configuration exactly as written, so the usual
 // quoting and word-splitting surprises cannot happen.
-func (r *Runner) runCommand(ctx context.Context, b config.Bundle) error {
+func (r *Runner) runCommand(ctx context.Context, e config.Exposure) error {
 	ctx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, b.OnChangeCommand[0], b.OnChangeCommand[1:]...)
-	cmd.Env = r.env
+	cmd := exec.CommandContext(ctx, e.OnChangeCommand[0], e.OnChangeCommand[1:]...)
 	start := time.Now()
 	output, err := cmd.CombinedOutput()
-	attrs := []any{"bundle", b.Name, "command", b.OnChangeCommand, "duration", time.Since(start)}
+	attrs := []any{"exposure", e.Name, "command", e.OnChangeCommand, "duration", time.Since(start)}
 	if trimmed := strings.TrimSpace(string(output)); trimmed != "" {
 		attrs = append(attrs, "output", truncate(trimmed, maxCommandOutput))
 	}
 	if err != nil {
 		r.log.Error("onChangeCommand failed", append(attrs, "error", err)...)
-		return fmt.Errorf("bundle %q: onChangeCommand %v: %w", b.Name, b.OnChangeCommand, err)
+		return fmt.Errorf("exposure %q: onChangeCommand %v: %w", e.Name, e.OnChangeCommand, err)
 	}
 	r.log.Info("onChangeCommand ran", attrs...)
 	return nil
 }
 
-func dirs(files []config.File) []string {
+func dirs(files []config.Target) []string {
 	var out []string
 	for _, f := range files {
 		if dir := filepath.Dir(f.Path); !slices.Contains(out, dir) {

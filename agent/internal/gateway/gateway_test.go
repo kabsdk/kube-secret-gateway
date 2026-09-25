@@ -37,13 +37,13 @@ func newClient(t *testing.T, base string, caFile string) *gateway.Client {
 	return c
 }
 
-func fetch(t *testing.T, c *gateway.Client, exposure, etag string) (*gateway.Bundle, error) {
+func fetch(t *testing.T, c *gateway.Client, exposure, etag string) (*gateway.Result, error) {
 	t.Helper()
 	return c.Fetch(context.Background(), exposure, etag, "fetcher", "hunter2")
 }
 
 // The request must be exactly what the gateway's routing accepts: one GET to
-// /bundles/{exposure}, with Basic Auth and the conditional header.
+// /exposures/{name}, with Basic Auth and the conditional header.
 func TestRequestShape(t *testing.T) {
 	var got *http.Request
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -54,7 +54,7 @@ func TestRequestShape(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	bundle, err := fetch(t, newClient(t, srv.URL+"/base/", ""), "my-cert", `"hmac-sha256:old"`)
+	result, err := fetch(t, newClient(t, srv.URL+"/base/", ""), "my-cert", `"hmac-sha256:old"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +62,7 @@ func TestRequestShape(t *testing.T) {
 		t.Fatalf("method = %s", got.Method)
 	}
 	// A trailing slash on the base URL must not produce a double slash.
-	if got.URL.Path != "/base/bundles/my-cert" {
+	if got.URL.Path != "/base/exposures/my-cert" {
 		t.Fatalf("path = %q", got.URL.Path)
 	}
 	if user, pass, ok := got.BasicAuth(); !ok || user != "fetcher" || pass != "hunter2" {
@@ -74,8 +74,8 @@ func TestRequestShape(t *testing.T) {
 	if h := got.Header.Get("User-Agent"); !strings.HasPrefix(h, "kube-secret-gateway-agent/") {
 		t.Fatalf("User-Agent = %q", h)
 	}
-	if string(bundle.Values["tls.crt"]) != "X" || bundle.ETag != `"hmac-sha256:abc"` {
-		t.Fatalf("bundle = %+v", bundle)
+	if string(result.Values["tls.crt"]) != "X" || result.ETag != `"hmac-sha256:abc"` {
+		t.Fatalf("result = %+v", result)
 	}
 }
 
@@ -116,10 +116,10 @@ func TestMalformedResponses(t *testing.T) {
 		want string
 	}{
 		{"no etag", "", `{"a":"YQ=="}`, "without an ETag"},
-		{"not json", `"t"`, `not json`, "malformed bundle"},
+		{"not json", `"t"`, `not json`, "malformed response"},
 		{"json null", `"t"`, `null`, "JSON null"},
-		{"json array", `"t"`, `["a"]`, "malformed bundle"},
-		{"values not base64", `"t"`, `{"a":"!!!not base64!!!"}`, "malformed bundle"},
+		{"json array", `"t"`, `["a"]`, "malformed response"},
+		{"values not base64", `"t"`, `{"a":"!!!not base64!!!"}`, "malformed response"},
 		{"trailing data", `"t"`, `{"a":"YQ=="}{"b":"Yg=="}`, "trailing data"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -150,8 +150,8 @@ func TestStatusErrorsExplainWhatToCheck(t *testing.T) {
 	}{
 		{http.StatusUnauthorized, []string{"401", "username or password"}},
 		{http.StatusNotFound, []string{"404", "not configured", "allowedCidrs"}},
-		{http.StatusServiceUnavailable, []string{"503", "includeKeys"}},
-		{http.StatusMethodNotAllowed, []string{"405", "not a kube-secret-gateway bundle endpoint"}},
+		{http.StatusServiceUnavailable, []string{"503", "configured key"}},
+		{http.StatusMethodNotAllowed, []string{"405", "not a kube-secret-gateway exposure endpoint"}},
 		{http.StatusBadGateway, []string{"unexpected status"}},
 	} {
 		t.Run(http.StatusText(tc.status), func(t *testing.T) {
@@ -176,13 +176,13 @@ func TestStatusErrorsExplainWhatToCheck(t *testing.T) {
 	}
 }
 
-func TestOversizedBundleIsRejected(t *testing.T) {
+func TestOversizedExposureIsRejected(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("ETag", `"t"`)
 		_, _ = w.Write([]byte(`{"a":"`))
-		// More base64 than MaxBundleBytes, never closed.
+		// More base64 than MaxExposureBytes, never closed.
 		chunk := strings.Repeat("QUFB", 4096)
-		for written := 0; written < gateway.MaxBundleBytes+len(chunk); written += len(chunk) {
+		for written := 0; written < gateway.MaxExposureBytes+len(chunk); written += len(chunk) {
 			if _, err := w.Write([]byte(chunk)); err != nil {
 				return
 			}

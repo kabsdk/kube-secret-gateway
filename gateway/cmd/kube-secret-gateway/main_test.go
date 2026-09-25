@@ -26,7 +26,7 @@ import (
 
 // TestEndToEnd runs the real binary wiring against a fake Kubernetes API
 // server speaking the list/watch protocol over HTTP, through client-go: once
-// with plain HTTP, and once with TLS on the Secrets listener and
+// with plain HTTP, and once with TLS on the delivery listener and
 // authentication on /metrics.
 func TestEndToEnd(t *testing.T) {
 	t.Run("plain", func(t *testing.T) { testEndToEnd(t, false) })
@@ -54,7 +54,7 @@ func testEndToEnd(t *testing.T, secure bool) {
 		writeFile(t, certFile, string(certPEM))
 		writeFile(t, keyFile, string(keyPEM))
 		serverExtra = fmt.Sprintf("  tls: {certFile: %q, keyFile: %q}\n", certFile, keyFile)
-		metricsExtra = "  auth: {type: basicAuth, secretRef: {namespace: monitoring, name: scrape-credentials}}\n"
+		metricsExtra = "  auth: {secretRef: {namespace: monitoring, name: scrape-credentials}}\n"
 		scheme = "https"
 		client = &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: ca.Pool()}}}
 	}
@@ -66,16 +66,17 @@ server:
   listenAddress: %q
 %skubernetes:
   defaultNamespace: certificates
-secrets:
-  - secretRef: {name: my-cert}
+exposures:
+  - name: my-cert
+    secretRef: {name: my-cert}
+    keys: [tls.crt]
     allowedCidrs: [127.0.0.1/32]
-    auth: {type: basicAuth, secretRef: {namespace: certificate-auth, name: fetcher}}
-    excludeKeys: [tls.key]
+    auth: {secretRef: {namespace: certificate-auth, name: fetcher}}
   - name: later
     secretRef: {name: created-later}
+    keys: [tls.crt]
     allowedCidrs: [127.0.0.1/32]
-    auth: {type: basicAuth, secretRef: {namespace: certificate-auth, name: fetcher}}
-    includeKeys: [tls.crt]
+    auth: {secretRef: {namespace: certificate-auth, name: fetcher}}
 `, addr, serverExtra, metricsAddr, metricsExtra))
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -127,35 +128,32 @@ secrets:
 	kube.waitWatching(t, "certificates", "my-cert")
 	kube.waitWatching(t, "certificates", "created-later")
 
-	if code, body := get("/secrets/my-cert/tls.crt"); code != 200 || body != "CERT-V1" {
+	if code, body := get("/exposures/my-cert"); code != 200 || body != `{"tls.crt":"Q0VSVC1WMQ=="}` {
 		t.Fatalf("initial GET = %d %q", code, body)
 	}
-	if code, _ := get("/secrets/my-cert/tls.key"); code != 404 {
-		t.Fatalf("excluded key = %d", code)
-	}
-	if code, _ := get("/secrets/later/tls.crt"); code != 503 {
+	if code, _ := get("/exposures/later"); code != 503 {
 		t.Fatalf("not yet created Secret = %d", code)
 	}
 	// Probes and metrics live only on the metrics listener.
 	for _, p := range []string{"/readyz", "/healthz", "/metrics"} {
 		if code, _ := get(p); code != 404 {
-			t.Fatalf("%s on the Secrets listener = %d, want 404", p, code)
+			t.Fatalf("%s on the delivery listener = %d, want 404", p, code)
 		}
 	}
 	if secure {
 		// Plain HTTP to the TLS listener is refused by net/http.
-		if code, _, err := do(http.DefaultClient, "http://"+addr+"/secrets/my-cert/tls.crt", nil); err == nil && code != http.StatusBadRequest {
+		if code, _, err := do(http.DefaultClient, "http://"+addr+"/exposures/my-cert", nil); err == nil && code != http.StatusBadRequest {
 			t.Fatalf("plain HTTP to the TLS listener = %d", code)
 		}
 	}
 
 	// Watch events flow through client-go into the cache.
 	kube.set("certificates", "my-cert", map[string][]byte{"tls.crt": []byte("CERT-V2")})
-	eventually(t, "modified value served", func() bool { _, b := get("/secrets/my-cert/tls.crt"); return b == "CERT-V2" })
+	eventually(t, "modified value served", func() bool { _, b := get("/exposures/my-cert"); return b == `{"tls.crt":"Q0VSVC1WMg=="}` })
 	kube.remove("certificates", "my-cert")
-	eventually(t, "deleted Secret unavailable", func() bool { c, _ := get("/secrets/my-cert/tls.crt"); return c == 503 })
+	eventually(t, "deleted Secret unavailable", func() bool { c, _ := get("/exposures/my-cert"); return c == 503 })
 	kube.set("certificates", "created-later", map[string][]byte{"tls.crt": []byte("LATE")})
-	eventually(t, "created Secret served", func() bool { _, b := get("/secrets/later/tls.crt"); return b == "LATE" })
+	eventually(t, "created Secret served", func() bool { _, b := get("/exposures/later"); return b == `{"tls.crt":"TEFURQ=="}` })
 
 	// Metrics reflect state without any request for the Secret.
 	if secure {
@@ -240,12 +238,14 @@ func TestMetricsAuthSecretRequiredAtStartup(t *testing.T) {
 server: {listenAddress: %q}
 metrics:
   listenAddress: %q
-  auth: {type: basicAuth, secretRef: {namespace: monitoring, name: scrape-credentials}}
+  auth: {secretRef: {namespace: monitoring, name: scrape-credentials}}
 kubernetes: {defaultNamespace: certificates}
-secrets:
-  - secretRef: {name: my-cert}
+exposures:
+  - name: my-cert
+    secretRef: {name: my-cert}
+    keys: [tls.crt]
     allowedCidrs: [127.0.0.1/32]
-    auth: {type: basicAuth, secretRef: {name: fetcher}}
+    auth: {secretRef: {name: fetcher}}
 `, freeAddress(t), freeAddress(t)))
 
 			logs := &lockedBuffer{}
@@ -266,7 +266,7 @@ secrets:
 func TestInvalidConfigurationFailsBeforeListening(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")
-	writeFile(t, configPath, "secrets:\n  - secretRef: {name: x}\n")
+	writeFile(t, configPath, "exposures:\n  - name: x\n    secretRef: {name: x}\n")
 	var stderr bytes.Buffer
 	if code := run(context.Background(), []string{"-config", configPath}, &stderr); code != 1 {
 		t.Fatalf("exit code %d, want 1", code)

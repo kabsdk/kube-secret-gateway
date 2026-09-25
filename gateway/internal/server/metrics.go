@@ -71,7 +71,7 @@ func (h *metricsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // authorize applies the optional /metrics authentication with the same
-// semantics as the Secret endpoints: an unusable authentication Secret is an
+// semantics as the exposure endpoint: an unusable authentication Secret is an
 // operational failure (503), wrong or missing credentials are a 401.
 func (h *metricsHandler) authorize(w http.ResponseWriter, r *http.Request) bool {
 	if h.auth == nil {
@@ -83,7 +83,7 @@ func (h *metricsHandler) authorize(w http.ResponseWriter, r *http.Request) bool 
 		writeError(w, http.StatusServiceUnavailable)
 		return false
 	}
-	verifier, err := auth.NewVerifier(h.auth.Type, secret.Data)
+	verifier, err := auth.NewBasic(secret.Data)
 	if err != nil {
 		h.log.Warn("metrics authentication Secret unusable", "namespace", h.auth.SecretRef.Namespace, "secret", h.auth.SecretRef.Name, "error", err)
 		writeError(w, http.StatusServiceUnavailable)

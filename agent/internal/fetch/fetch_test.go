@@ -31,7 +31,7 @@ type harness struct {
 	runner   *fetch.Runner
 	dir      string // installed files
 	stateDir string
-	bundle   config.Bundle
+	exposure config.Exposure
 	// marker is appended to by the default onChangeCommand.
 	marker string
 	logs   *strings.Builder
@@ -59,7 +59,7 @@ func newHarness(t *testing.T, extra ...string) *harness {
 	h.marker = filepath.Join(root, "reloads")
 
 	passwordFile := filepath.Join(root, "password")
-	if err := os.WriteFile(passwordFile, []byte("correct horse battery staple\n"), 0o600); err != nil {
+	if err := os.WriteFile(passwordFile, []byte("correct horse battery staple"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -68,16 +68,17 @@ gateway:
   url: %s
 exposures:
   - name: my-cert
-    username: fetcher
-    passwordFile: %s
-bundles:
-  - name: nginx-tls
-    exposure: my-cert
+    auth:
+      username: fetcher
+      passwordFile: %s
     interval: 30s
     onChangeCommand: [sh, -c, "echo ran >> %s"]
-    files:
-      tls.crt: {path: %s/tls.crt, mode: "0644"}
-      tls.key: %s/tls.key
+    targets:
+      - key: tls.crt
+        path: %s/tls.crt
+        mode: "0644"
+      - key: tls.key
+        path: %s/tls.key
 %s`, h.gw.URL(), passwordFile, h.marker, h.dir, h.dir, strings.Join(extra, "\n"))
 
 	cfg, err := config.Parse([]byte(yaml))
@@ -85,7 +86,7 @@ bundles:
 		t.Fatalf("config: %v", err)
 	}
 	h.cfg = cfg
-	h.bundle = cfg.Bundles[0]
+	h.exposure = cfg.Exposures[0]
 
 	client, err := gateway.New(cfg.Gateway, "test")
 	if err != nil {
@@ -101,7 +102,7 @@ bundles:
 
 func (h *harness) sync() (bool, error) {
 	h.t.Helper()
-	return h.runner.Sync(context.Background(), h.bundle)
+	return h.runner.Sync(context.Background(), h.exposure)
 }
 
 func (h *harness) mustSync(wantChanged bool) {
@@ -163,20 +164,20 @@ func TestColdInstall(t *testing.T) {
 		t.Fatalf("tls.key mode = %o, want 600", got)
 	}
 	// ca.crt is served by the exposure but not configured, so it is not
-	// installed: a bundle contains what the exposure serves, and a client
-	// installs the subset it asked for.
+	// installed: targets select the local subset, but the client received the
+	// complete exposure.
 	if _, err := os.Stat(filepath.Join(h.dir, "ca.crt")); !os.IsNotExist(err) {
 		t.Fatal("installed a key that the configuration does not list")
 	}
 	if got := h.reloads(); got != 1 {
 		t.Fatalf("onChangeCommand ran %d times, want 1", got)
 	}
-	for _, name := range []string{"nginx-tls.etag", "nginx-tls.stamp"} {
+	for _, name := range []string{"my-cert.etag", "my-cert.stamp"} {
 		if _, err := os.Stat(filepath.Join(h.stateDir, name)); err != nil {
 			t.Fatalf("state file %s: %v", name, err)
 		}
 	}
-	etag, err := os.ReadFile(filepath.Join(h.stateDir, "nginx-tls.etag"))
+	etag, err := os.ReadFile(filepath.Join(h.stateDir, "my-cert.etag"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +186,7 @@ func TestColdInstall(t *testing.T) {
 	}
 }
 
-func TestUnchangedBundleInstallsNothing(t *testing.T) {
+func TestUnchangedExposureInstallsNothing(t *testing.T) {
 	h := newHarness(t)
 	h.mustSync(true)
 	before, err := os.Stat(filepath.Join(h.dir, "tls.crt"))
@@ -201,7 +202,7 @@ func TestUnchangedBundleInstallsNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !before.ModTime().Equal(after.ModTime()) {
-		t.Fatal("an unchanged bundle rewrote the file")
+		t.Fatal("an unchanged exposure rewrote the file")
 	}
 	if got := h.reloads(); got != 1 {
 		t.Fatalf("onChangeCommand ran %d times, want 1", got)
@@ -212,8 +213,8 @@ func TestUnchangedBundleInstallsNothing(t *testing.T) {
 	}
 }
 
-// TestRotationInstallsTheWholeSet is the point of bundles: one request returns
-// one version of the Secret, so the certificate and the key always match.
+// One request returns one exposure snapshot, so the certificate and key are
+// always from the same version of the Secret.
 func TestRotationInstallsTheWholeSet(t *testing.T) {
 	h := newHarness(t)
 	h.mustSync(true)
@@ -233,9 +234,9 @@ func TestRotationInstallsTheWholeSet(t *testing.T) {
 	h.mustSync(false)
 }
 
-// A change to one key of the bundle changes the tag of the whole bundle, so
-// the client reinstalls both files and they stay from the same version.
-func TestChangeToOneKeyRefreshesTheBundle(t *testing.T) {
+// A change to one exposure key changes the tag of the complete snapshot, so
+// the client reinstalls both targets and they stay from the same version.
+func TestChangeToOneKeyRefreshesTheExposure(t *testing.T) {
 	h := newHarness(t)
 	h.mustSync(true)
 	h.gw.Rotate("my-cert", map[string][]byte{"tls.key": []byte(keyV2)})
@@ -248,13 +249,12 @@ func TestChangeToOneKeyRefreshesTheBundle(t *testing.T) {
 	}
 }
 
-// A key added to the Secret but not configured must not make the client think
-// something changed on disk.
-func TestUnconfiguredKeyStillChangesTheTag(t *testing.T) {
+// A returned key without a local target still changes the exposure ETag.
+func TestUntargetedKeyStillChangesTheTag(t *testing.T) {
 	h := newHarness(t)
 	h.mustSync(true)
 	h.gw.Rotate("my-cert", map[string][]byte{"extra": []byte("x")})
-	// The bundle's ETag covers everything the exposure serves, so this is a
+	// The exposure's ETag covers everything it serves, so this is a
 	// change: the client refetches and rewrites the same bytes. That costs one
 	// download and is the price of a single tag for the set.
 	h.mustSync(true)
@@ -271,7 +271,7 @@ func TestDeletedFileIsReinstalled(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The stored ETag describes files on disk. One of them is gone, so it is
-	// not trusted and the whole bundle is fetched again.
+	// not trusted and the complete exposure is fetched again.
 	h.mustSync(true)
 	if got := h.read("tls.key"); got != keyV1 {
 		t.Fatalf("tls.key = %q", got)
@@ -297,7 +297,7 @@ func TestMissingConfiguredKeyIsAnError(t *testing.T) {
 
 	_, err := h.sync()
 	if err == nil {
-		t.Fatal("a bundle without a configured key must fail")
+		t.Fatal("an exposure without a configured target key must fail")
 	}
 	for _, want := range []string{"tls.key", "my-cert"} {
 		if !strings.Contains(err.Error(), want) {
@@ -349,11 +349,10 @@ func TestGatewayErrorsLeaveFilesAlone(t *testing.T) {
 
 func TestWrongPasswordIsReported(t *testing.T) {
 	h := newHarness(t)
-	h.cfg.Bundles[0].Exposure = "my-cert"
 	// Rewrite the password file to something wrong: credentials are read per
 	// fetch, so no restart is needed for this to take effect.
-	passwordFile := h.cfg.Credentials(h.bundle).PasswordFile
-	if err := os.WriteFile(passwordFile, []byte("wrong\n"), 0o600); err != nil {
+	passwordFile := h.exposure.Auth.PasswordFile
+	if err := os.WriteFile(passwordFile, []byte("wrong"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	_, err := h.sync()
@@ -364,15 +363,15 @@ func TestWrongPasswordIsReported(t *testing.T) {
 
 func TestCredentialsAreRereadEachFetch(t *testing.T) {
 	h := newHarness(t)
-	passwordFile := h.cfg.Credentials(h.bundle).PasswordFile
-	if err := os.WriteFile(passwordFile, []byte("wrong\n"), 0o600); err != nil {
+	passwordFile := h.exposure.Auth.PasswordFile
+	if err := os.WriteFile(passwordFile, []byte("wrong"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := h.sync(); err == nil {
 		t.Fatal("expected a 401")
 	}
 	// Rotating the credentials file is enough; the process keeps running.
-	if err := os.WriteFile(passwordFile, []byte("correct horse battery staple\n"), 0o600); err != nil {
+	if err := os.WriteFile(passwordFile, []byte("correct horse battery staple"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	h.mustSync(true)
@@ -391,7 +390,7 @@ func TestPreparationFailureLeavesSetUntouched(t *testing.T) {
 	if err := os.MkdirAll(blocked, 0o500); err != nil {
 		t.Fatal(err)
 	}
-	h.bundle.Files[1].Path = filepath.Join(blocked, "tls.key")
+	h.exposure.Targets[1].Path = filepath.Join(blocked, "tls.key")
 
 	if _, err := h.sync(); err == nil {
 		t.Skip("writing into a read-only directory succeeded; test needs an unprivileged user")
@@ -413,6 +412,71 @@ func TestPreparationFailureLeavesSetUntouched(t *testing.T) {
 	}
 }
 
+func TestPartialInstallationIsRecoveredWithoutCommittingState(t *testing.T) {
+	h := newHarness(t)
+	h.mustSync(true)
+
+	etagPath := filepath.Join(h.stateDir, "my-cert.etag")
+	stampPath := filepath.Join(h.stateDir, "my-cert.stamp")
+	oldETag, err := os.ReadFile(etagPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldStamp, err := os.ReadFile(stampPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	h.gw.Rotate("my-cert", map[string][]byte{"tls.crt": []byte(certV2), "tls.key": []byte(keyV2)})
+	keyPath := h.exposure.Targets[1].Path
+	if err := os.Remove(keyPath); err != nil {
+		t.Fatal(err)
+	}
+	// Staging still succeeds beside this directory, but the second rename
+	// cannot replace a directory. The first rename has already landed.
+	if err := os.Mkdir(keyPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := h.sync(); err == nil {
+		t.Fatal("partial installation succeeded")
+	}
+	if got := h.read("tls.crt"); got != certV2 {
+		t.Fatalf("first target = %q, want the partially installed new value", got)
+	}
+	if got, err := os.ReadFile(etagPath); err != nil || string(got) != string(oldETag) {
+		t.Fatalf("ETag changed after partial installation: %q, %v", got, err)
+	}
+	if got, err := os.ReadFile(stampPath); err != nil || string(got) != string(oldStamp) {
+		t.Fatalf("stamp changed after partial installation: %q, %v", got, err)
+	}
+
+	if err := os.Remove(keyPath); err != nil {
+		t.Fatal(err)
+	}
+	h.mustSync(true)
+	if got := h.read("tls.crt"); got != certV2 {
+		t.Fatalf("tls.crt after recovery = %q", got)
+	}
+	if got := h.read("tls.key"); got != keyV2 {
+		t.Fatalf("tls.key after recovery = %q", got)
+	}
+	newETag, err := os.ReadFile(etagPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(newETag) == string(oldETag) {
+		t.Fatal("recovery did not commit the new ETag")
+	}
+	newStamp, err := os.ReadFile(stampPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(newStamp) == string(oldStamp) {
+		t.Fatal("recovery did not update the stamp")
+	}
+}
+
 func TestLogsNeverContainSecretsOrCredentials(t *testing.T) {
 	h := newHarness(t)
 	h.mustSync(true)
@@ -430,27 +494,30 @@ func TestLogsNeverContainSecretsOrCredentials(t *testing.T) {
 	}
 }
 
-func TestOnceRunsEveryBundleEvenIfOneFails(t *testing.T) {
+func TestOnceRunsEveryExposureEvenIfOneFails(t *testing.T) {
 	h := newHarness(t, `  - name: broken
-    exposure: my-cert
-    files:
-      no-such-key: /dev/null/impossible`)
-	if len(h.cfg.Bundles) != 2 {
-		t.Fatalf("configured %d bundles", len(h.cfg.Bundles))
+    auth:
+      username: fetcher
+      passwordFile: /definitely/missing
+    targets:
+      - key: no-such-key
+        path: /dev/null/impossible`)
+	if len(h.cfg.Exposures) != 2 {
+		t.Fatalf("configured %d exposures", len(h.cfg.Exposures))
 	}
 	err := h.runner.Once(context.Background())
 	if err == nil {
-		t.Fatal("Once must report the broken bundle")
+		t.Fatal("Once must report the broken exposure")
 	}
-	// The healthy bundle was still installed.
+	// The healthy exposure was still installed.
 	if got := h.read("tls.crt"); got != certV1 {
-		t.Fatalf("tls.crt = %q: a broken bundle stopped a healthy one", got)
+		t.Fatalf("tls.crt = %q: a broken exposure stopped a healthy one", got)
 	}
 }
 
 func TestOnChangeCommandFailureIsReportedButFilesStay(t *testing.T) {
 	h := newHarness(t)
-	h.bundle.OnChangeCommand = []string{"false"}
+	h.exposure.OnChangeCommand = []string{"false"}
 	changed, err := h.sync()
 	if err == nil {
 		t.Fatal("a failing onChangeCommand must be an error")
@@ -464,51 +531,19 @@ func TestOnChangeCommandFailureIsReportedButFilesStay(t *testing.T) {
 
 	// A transient reload failure must be retried even though the files are
 	// already current. The ETag is not committed until the command succeeds.
-	h.bundle.OnChangeCommand = []string{"sh", "-c", "echo ran >> " + h.marker}
+	h.exposure.OnChangeCommand = []string{"sh", "-c", "echo ran >> " + h.marker}
 	h.mustSync(true)
 	if got := h.reloads(); got != 1 {
 		t.Fatalf("successful retry ran %d times, want 1", got)
 	}
 }
 
-func TestOnChangeCommandDoesNotSeeThePassword(t *testing.T) {
-	const envName = "KSG_TEST_PASSWORD"
-	t.Setenv(envName, "correct horse battery staple")
-
+func TestOnChangeCommandDoesNotReceiveThePassword(t *testing.T) {
 	h := newHarness(t)
-	// Reconfigure the exposure to take its password from the environment.
 	root := filepath.Dir(h.dir)
 	dump := filepath.Join(root, "env")
-	yaml := fmt.Sprintf(`
-gateway:
-  url: %s
-exposures:
-  - name: my-cert
-    username: fetcher
-    passwordEnv: %s
-bundles:
-  - name: nginx-tls
-    exposure: my-cert
-    onChangeCommand: [sh, -c, "env > %s"]
-    files:
-      tls.crt: %s/tls.crt
-`, h.gw.URL(), envName, dump, h.dir)
-	cfg, err := config.Parse([]byte(yaml))
-	if err != nil {
-		t.Fatal(err)
-	}
-	client, err := gateway.New(cfg.Gateway, "test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	runner, err := fetch.NewRunner(cfg, fetch.Options{
-		Client: client, StateDir: h.stateDir,
-		Logger: slog.New(slog.NewTextHandler(h.logs, nil)),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := runner.Sync(context.Background(), cfg.Bundles[0]); err != nil {
+	h.exposure.OnChangeCommand = []string{"sh", "-c", "env > " + dump}
+	if _, err := h.sync(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -516,14 +551,14 @@ bundles:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(env), envName) || strings.Contains(string(env), "correct horse") {
+	if strings.Contains(string(env), "correct horse battery staple") {
 		t.Fatal("the onChangeCommand inherited the password")
 	}
 }
 
 func TestServePollsUntilCancelled(t *testing.T) {
 	h := newHarness(t)
-	h.cfg.Bundles[0].Interval = 20 * time.Millisecond
+	h.cfg.Exposures[0].Interval = 20 * time.Millisecond
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})

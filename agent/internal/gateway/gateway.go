@@ -1,9 +1,7 @@
 // Package gateway is the HTTP client for one kube-secret-gateway.
 //
-// It speaks only GET /bundles/{exposure}: one request returns every key an
-// exposure serves, from one version of the Secret, under one ETag. Fetching
-// keys one at a time through /secrets/{exposure}/{key} cannot offer that,
-// because an update can land between two requests.
+// It speaks only GET /exposures/{name}: one request returns every configured
+// key from one version of the Kubernetes Secret, under one ETag.
 package gateway
 
 import (
@@ -22,16 +20,16 @@ import (
 	"kube-secret-gateway-agent/internal/config"
 )
 
-// MaxBundleBytes caps the response body. A Kubernetes Secret holds at most
+// MaxExposureBytes caps the response body. A Kubernetes Secret holds at most
 // 1 MiB, which base64 inflates by a third; the rest is headroom. The limit
 // exists so that a misdirected request cannot exhaust memory.
-const MaxBundleBytes = 8 << 20
+const MaxExposureBytes = 8 << 20
 
-// ErrNotModified reports that the gateway answered 304: the bundle is
+// ErrNotModified reports that the gateway answered 304: the exposure is
 // byte-for-byte what the ETag described, and nothing needs to be installed.
-var ErrNotModified = errors.New("bundle not modified")
+var ErrNotModified = errors.New("exposure not modified")
 
-// Client fetches bundles. It is safe for concurrent use.
+// Client fetches exposures. It is safe for concurrent use.
 type Client struct {
 	base    *url.URL
 	http    *http.Client
@@ -63,8 +61,8 @@ func New(g config.Gateway, version string) (*Client, error) {
 	}, nil
 }
 
-// Bundle is one version of everything an exposure serves.
-type Bundle struct {
+// Result is one fetched version of an exposure.
+type Result struct {
 	// Values are the Secret's keys, decoded. It is only the keys the exposure
 	// serves, which may be more than a caller installs.
 	Values map[string][]byte
@@ -73,10 +71,10 @@ type Bundle struct {
 	ETag string
 }
 
-// Fetch returns the exposure's bundle, or ErrNotModified when etag still
+// Fetch returns the exposure, or ErrNotModified when etag still
 // describes it. An empty etag always fetches.
-func (c *Client) Fetch(ctx context.Context, exposure, etag, username, password string) (*Bundle, error) {
-	target := c.base.JoinPath("bundles", exposure)
+func (c *Client) Fetch(ctx context.Context, exposure, etag, username, password string) (*Result, error) {
+	target := c.base.JoinPath("exposures", exposure)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
 	if err != nil {
 		return nil, err
@@ -109,22 +107,21 @@ func (c *Client) Fetch(ctx context.Context, exposure, etag, username, password s
 
 	newETag := resp.Header.Get("ETag")
 	if newETag == "" {
-		return nil, fmt.Errorf("exposure %q: 200 without an ETag: this is not a kube-secret-gateway bundle endpoint", exposure)
+		return nil, fmt.Errorf("exposure %q: 200 without an ETag: this is not a kube-secret-gateway exposure endpoint", exposure)
 	}
 	var values map[string][]byte
-	dec := json.NewDecoder(io.LimitReader(resp.Body, MaxBundleBytes))
+	dec := json.NewDecoder(io.LimitReader(resp.Body, MaxExposureBytes))
 	if err := dec.Decode(&values); err != nil {
-		return nil, fmt.Errorf("exposure %q: malformed bundle: %w", exposure, err)
+		return nil, fmt.Errorf("exposure %q: malformed response: %w", exposure, err)
 	}
 	if values == nil {
-		return nil, fmt.Errorf("exposure %q: bundle is JSON null, not an object", exposure)
+		return nil, fmt.Errorf("exposure %q: response is JSON null, not an object", exposure)
 	}
-	// A bundle is exactly one JSON object. Anything after it means the
-	// response did not come from a bundle endpoint.
+	// An exposure response is exactly one JSON object.
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-		return nil, fmt.Errorf("exposure %q: trailing data after the bundle", exposure)
+		return nil, fmt.Errorf("exposure %q: trailing data after the response", exposure)
 	}
-	return &Bundle{Values: values, ETag: newETag}, nil
+	return &Result{Values: values, ETag: newETag}, nil
 }
 
 // statusError turns a response into an error that says what to check. The
@@ -136,14 +133,13 @@ func statusError(exposure string, resp *http.Response) error {
 		return fmt.Errorf("exposure %q: 401: the username or password is wrong", exposure)
 	case http.StatusNotFound:
 		return fmt.Errorf("exposure %q: 404: either the exposure is not configured on the gateway, "+
-			"or this client's address is outside its allowedCidrs, or the gateway does not serve "+
-			"/bundles/ yet", exposure)
+			"or this client's address is outside its allowedCidrs", exposure)
 	case http.StatusServiceUnavailable:
-		return fmt.Errorf("exposure %q: 503: the gateway is running but a Secret is not in the "+
-			"expected state, such as a key promised by includeKeys that the Secret does not have; "+
+		return fmt.Errorf("exposure %q: 503: the gateway is running but a Kubernetes Secret is not in the "+
+			"expected state, such as a configured key that the source Secret does not have; "+
 			"check the gateway's logs and metrics", exposure)
 	case http.StatusMethodNotAllowed:
-		return fmt.Errorf("exposure %q: 405: the URL is not a kube-secret-gateway bundle endpoint", exposure)
+		return fmt.Errorf("exposure %q: 405: the URL is not a kube-secret-gateway exposure endpoint", exposure)
 	default:
 		return fmt.Errorf("exposure %q: unexpected status %s", exposure, resp.Status)
 	}
