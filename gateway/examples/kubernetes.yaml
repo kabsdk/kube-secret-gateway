@@ -20,21 +20,20 @@ data:
       defaultNamespace: kube-secret-gateway
       reconcileInterval: 5m
 
-    secrets:
+    exposures:
       - name: my-cert
         secretRef:
           name: my-cert
+        keys:
+          - tls.crt
+          - tls.key
         # Replace with the destination host's address, or with the address
         # preserved by a trusted reverse proxy.
         allowedCidrs:
           - 192.0.2.10/32
         auth:
-          type: basicAuth
           secretRef:
             name: my-cert-fetcher
-        includeKeys:
-          - tls.crt
-          - tls.key
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -89,8 +88,9 @@ spec:
           type: RuntimeDefault
       containers:
         - name: gateway
-          # Pin a release digest in production for full reproducibility.
-          image: ghcr.io/kabsdk/kube-secret-gateway:v0.1.0
+          # v0.2.0 is an example release tag. Replace it with the release you
+          # want to run; pin its digest in production for full reproducibility.
+          image: ghcr.io/kabsdk/kube-secret-gateway:v0.2.0
           imagePullPolicy: IfNotPresent
           args:
             - -config=/etc/kube-secret-gateway/config.yaml

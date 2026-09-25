@@ -4,8 +4,6 @@ import (
 	"errors"
 	"net/http"
 	"testing"
-
-	"kube-secret-gateway/internal/exposure"
 )
 
 func secretData(username, password string) map[string][]byte {
@@ -14,7 +12,7 @@ func secretData(username, password string) map[string][]byte {
 
 func request(t *testing.T, setup func(r *http.Request)) *http.Request {
 	t.Helper()
-	r, err := http.NewRequest(http.MethodGet, "/secrets/x/y", nil)
+	r, err := http.NewRequest(http.MethodGet, "/exposures/x", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -25,9 +23,9 @@ func request(t *testing.T, setup func(r *http.Request)) *http.Request {
 }
 
 func TestBasicVerify(t *testing.T) {
-	v, err := NewVerifier(exposure.AuthBasic, secretData("fetcher", "s3cret"))
+	v, err := NewBasic(secretData("fetcher", "s3cret"))
 	if err != nil {
-		t.Fatalf("NewVerifier: %v", err)
+		t.Fatalf("NewBasic: %v", err)
 	}
 	cases := []struct {
 		name  string
@@ -67,16 +65,10 @@ func TestMalformedSecret(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := NewVerifier(exposure.AuthBasic, tc.data); !errors.Is(err, tc.want) {
+			if _, err := NewBasic(tc.data); !errors.Is(err, tc.want) {
 				t.Fatalf("err = %v, want %v", err, tc.want)
 			}
 		})
-	}
-}
-
-func TestUnsupportedType(t *testing.T) {
-	if _, err := NewVerifier("bearerToken", secretData("u", "p")); !errors.Is(err, ErrUnsupportedType) {
-		t.Fatalf("err = %v, want ErrUnsupportedType", err)
 	}
 }
 
@@ -87,16 +79,21 @@ func TestChallenge(t *testing.T) {
 	}
 }
 
-func TestBinaryCredentials(t *testing.T) {
-	// Values are compared byte for byte; nothing is trimmed or normalized.
-	v, err := NewBasic(secretData("fetcher", "s3cret\n"))
+func TestCredentialsAreComparedExactly(t *testing.T) {
+	v, err := NewBasic(secretData("fetcher\n", "s3cret\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if v.Verify(request(t, func(r *http.Request) { r.SetBasicAuth("fetcher", "s3cret") })) {
-		t.Fatal("trailing newline in the stored password must not be ignored")
+		t.Fatal("line endings in stored credentials were ignored")
 	}
-	if !v.Verify(request(t, func(r *http.Request) { r.SetBasicAuth("fetcher", "s3cret\n") })) {
-		t.Fatal("exact bytes must verify")
+	if v.Verify(request(t, func(r *http.Request) { r.SetBasicAuth("fetcher\n", "s3cret") })) {
+		t.Fatal("password line ending was ignored")
+	}
+	if v.Verify(request(t, func(r *http.Request) { r.SetBasicAuth("fetcher", "s3cret\n") })) {
+		t.Fatal("username line ending was ignored")
+	}
+	if !v.Verify(request(t, func(r *http.Request) { r.SetBasicAuth("fetcher\n", "s3cret\n") })) {
+		t.Fatal("exact credential bytes did not verify")
 	}
 }

@@ -95,8 +95,7 @@ func Load(path string) (*Config, error) {
 	return Parse(data)
 }
 
-// Parse validates a YAML configuration document. Unknown fields are rejected,
-// so a misspelt option such as "excludekeys" cannot silently widen exposure.
+// Parse validates a YAML configuration document. Unknown fields are rejected.
 func Parse(data []byte) (*Config, error) {
 	var doc document
 	dec := yaml.NewDecoder(bytes.NewReader(data))
@@ -122,7 +121,7 @@ type document struct {
 	Server     serverSection     `yaml:"server"`
 	Metrics    metricsSection    `yaml:"metrics"`
 	Kubernetes kubernetesSection `yaml:"kubernetes"`
-	Secrets    []secretSection   `yaml:"secrets"`
+	Exposures  []exposureSection `yaml:"exposures"`
 }
 
 // Listen addresses are pointers so that an absent value (use the default)
@@ -150,13 +149,12 @@ type kubernetesSection struct {
 	ReconcileInterval *string `yaml:"reconcileInterval"`
 }
 
-type secretSection struct {
+type exposureSection struct {
 	Name         string       `yaml:"name"`
 	SecretRef    secretRef    `yaml:"secretRef"`
 	AllowedCIDRs []string     `yaml:"allowedCidrs"`
 	Auth         *authSection `yaml:"auth"`
-	IncludeKeys  []string     `yaml:"includeKeys"`
-	ExcludeKeys  []string     `yaml:"excludeKeys"`
+	Keys         []string     `yaml:"keys"`
 }
 
 type secretRef struct {
@@ -165,7 +163,6 @@ type secretRef struct {
 }
 
 type authSection struct {
-	Type      string    `yaml:"type"`
 	SecretRef secretRef `yaml:"secretRef"`
 }
 
@@ -214,16 +211,16 @@ func (d *document) resolve() (*Config, error) {
 		cfg.ReconcileInterval = interval
 	}
 
-	if len(d.Secrets) == 0 {
-		v.addf("secrets: at least one exposure must be configured")
+	if len(d.Exposures) == 0 {
+		v.addf("exposures: at least one exposure must be configured")
 	}
-	firstUse := make(map[string]int, len(d.Secrets))
-	for i := range d.Secrets {
-		path := fmt.Sprintf("secrets[%d]", i)
-		exp := d.Secrets[i].resolve(v, path, defaultNS)
+	firstUse := make(map[string]int, len(d.Exposures))
+	for i := range d.Exposures {
+		path := fmt.Sprintf("exposures[%d]", i)
+		exp := d.Exposures[i].resolve(v, path, defaultNS)
 		if exp.Name != "" {
 			if j, dup := firstUse[exp.Name]; dup {
-				v.addf("%s: duplicate exposure name %q (already used by secrets[%d]; names default to secretRef.name)", path, exp.Name, j)
+				v.addf("%s: duplicate exposure name %q (already used by exposures[%d])", path, exp.Name, j)
 			} else {
 				firstUse[exp.Name] = i
 			}
@@ -237,18 +234,16 @@ func (d *document) resolve() (*Config, error) {
 	return cfg, nil
 }
 
-func (s *secretSection) resolve(v *validator, path, defaultNS string) exposure.Exposure {
+func (s *exposureSection) resolve(v *validator, path, defaultNS string) exposure.Exposure {
 	exp := exposure.Exposure{
 		Name:         s.Name,
 		Source:       v.secretRef(path+".secretRef", s.SecretRef, defaultNS),
 		AllowedCIDRs: v.prefixes(path+".allowedCidrs", s.AllowedCIDRs, true),
 		Auth:         v.auth(path+".auth", s.Auth, defaultNS),
-		Keys:         v.keyFilter(path, s.IncludeKeys, s.ExcludeKeys),
+		Keys:         v.keys(path+".keys", s.Keys),
 	}
 	if exp.Name == "" {
-		// A valid Secret name is always a valid exposure name, and an invalid
-		// one has already been reported against secretRef.name.
-		exp.Name = s.SecretRef.Name
+		v.addf("%s.name: required", path)
 	} else if err := exposure.ValidateName(exp.Name); err != nil {
 		v.addf("%s.name: invalid exposure name %q: %v", path, exp.Name, err)
 	}
@@ -301,59 +296,31 @@ func (v *validator) auth(path string, a *authSection, defaultNS string) exposure
 		v.addf("%s: required", path)
 		return exposure.Auth{}
 	}
-	switch exposure.AuthType(a.Type) {
-	case exposure.AuthBasic:
-	case "":
-		v.addf("%s.type: required (supported: %s)", path, exposure.AuthBasic)
-	default:
-		v.addf("%s.type: unsupported auth type %q (supported: %s)", path, a.Type, exposure.AuthBasic)
-	}
 	return exposure.Auth{
-		Type:      exposure.AuthType(a.Type),
 		SecretRef: v.secretRef(path+".secretRef", a.SecretRef, defaultNS),
 	}
 }
 
-// keyFilter distinguishes an absent list (nil) from an explicitly empty one:
-// "includeKeys: []" would expose nothing and is rejected rather than being
-// silently treated as "all keys".
-func (v *validator) keyFilter(path string, include, exclude []string) exposure.KeyFilter {
-	switch {
-	case include != nil && exclude != nil:
-		v.addf("%s: includeKeys and excludeKeys are mutually exclusive", path)
-	case include != nil:
-		if v.keys(path+".includeKeys", include) {
-			return exposure.IncludeKeys(include...)
-		}
-	case exclude != nil:
-		if v.keys(path+".excludeKeys", exclude) {
-			return exposure.ExcludeKeys(exclude...)
-		}
-	}
-	return exposure.KeyFilter{}
-}
-
-func (v *validator) keys(path string, keys []string) bool {
+func (v *validator) keys(path string, keys []string) []string {
 	if len(keys) == 0 {
-		v.addf("%s: must not be empty when set", path)
-		return false
+		v.addf("%s: at least one key is required", path)
+		return nil
 	}
-	ok := true
 	seen := make(map[string]int, len(keys))
+	out := make([]string, 0, len(keys))
 	for i, k := range keys {
 		if err := exposure.ValidateKey(k); err != nil {
 			v.addf("%s[%d]: invalid Secret key %q: %v", path, i, k, err)
-			ok = false
 			continue
 		}
 		if j, dup := seen[k]; dup {
 			v.addf("%s[%d]: duplicate of %s[%d] (%q)", path, i, path, j, k)
-			ok = false
 			continue
 		}
 		seen[k] = i
+		out = append(out, k)
 	}
-	return ok
+	return out
 }
 
 func (v *validator) listenAddress(path string, value *string, def string) string {

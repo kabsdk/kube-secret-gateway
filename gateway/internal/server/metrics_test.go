@@ -40,7 +40,7 @@ func newMetricsFixture(t *testing.T, withAuth bool) *metricsFixture {
 		Logger:  slog.New(slog.NewJSONHandler(f.logs, nil)),
 	}
 	if withAuth {
-		opts.Auth = &exposure.Auth{Type: exposure.AuthBasic, SecretRef: scrapeRef}
+		opts.Auth = &exposure.Auth{SecretRef: scrapeRef}
 	}
 	h, err := server.NewMetricsHandler(opts)
 	if err != nil {
@@ -79,7 +79,7 @@ func TestMetricsListenerRoutes(t *testing.T) {
 	expectStatus(t, f.do(http.MethodGet, "/readyz"), http.StatusServiceUnavailable)
 	expectStatus(t, f.do(http.MethodGet, "/healthz"), http.StatusOK)
 
-	for _, p := range []string{"/", "/secrets/my-cert/tls.crt", "/metrics/", "/healthz/", "/%6detrics", "/metrics/../metrics"} {
+	for _, p := range []string{"/", "/exposures/my-cert", "/metrics/", "/healthz/", "/%6detrics", "/metrics/../metrics"} {
 		expectStatus(t, f.do(http.MethodGet, p), http.StatusNotFound)
 	}
 	expectStatus(t, f.do(http.MethodPost, "/metrics"), http.StatusMethodNotAllowed)
@@ -139,7 +139,7 @@ func TestNewMetricsHandlerRejectsIncompleteOptions(t *testing.T) {
 		"empty":           {},
 		"no metrics":      {Ready: ready, Logger: logger},
 		"no ready":        {Metrics: stubMetrics, Logger: logger},
-		"auth no secrets": {Metrics: stubMetrics, Ready: ready, Logger: logger, Auth: &exposure.Auth{Type: exposure.AuthBasic, SecretRef: scrapeRef}},
+		"auth no secrets": {Metrics: stubMetrics, Ready: ready, Logger: logger, Auth: &exposure.Auth{SecretRef: scrapeRef}},
 	} {
 		if _, err := server.NewMetricsHandler(opts); err == nil {
 			t.Errorf("%s: accepted", name)

@@ -1,15 +1,15 @@
 # Reload without letting the agent run commands: leave onChangeCommand out of
-# the bundle and watch its stamp file instead.
+# the exposure and watch its stamp file instead.
 #
 # Watch the stamp, never an installed file. The stamp is written only after
-# every file of the bundle has landed; a .path unit on tls.crt fires as soon
+# every target of the exposure has landed; a .path unit on tls.crt fires as soon
 # as that file is closed, which can reload nginx with a new certificate and
 # the old key.
 [Unit]
-Description=Reload nginx when the nginx-tls bundle changes
+Description=Reload nginx when the my-cert exposure changes
 
 [Path]
-PathChanged=/var/lib/kube-secret-gateway-agent/nginx-tls.stamp
+PathChanged=/var/lib/kube-secret-gateway-agent/my-cert.stamp
 Unit=nginx-reload.service
 
 [Install]

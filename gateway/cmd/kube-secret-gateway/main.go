@@ -248,7 +248,7 @@ func checkMetricsAuth(ctx context.Context, manager *resources.Manager, a exposur
 	if !s.Present {
 		return errors.New("the Secret does not exist")
 	}
-	_, err := auth.NewVerifier(a.Type, s.Data)
+	_, err := auth.NewBasic(s.Data)
 	return err
 }
 
@@ -282,8 +282,8 @@ func logStartup(logger *slog.Logger, path string, cfg *config.Config, secretsTLS
 		e := &cfg.Exposures[i]
 		logger.Info("exposure configured", "exposure", e.Name,
 			"namespace", e.Source.Namespace, "secret", e.Source.Name,
-			"auth_type", string(e.Auth.Type), "auth_namespace", e.Auth.SecretRef.Namespace, "auth_secret", e.Auth.SecretRef.Name,
-			"allowed_cidrs", len(e.AllowedCIDRs), "required_keys", e.Keys.RequiredKeys())
+			"auth_namespace", e.Auth.SecretRef.Namespace, "auth_secret", e.Auth.SecretRef.Name,
+			"allowed_cidrs", len(e.AllowedCIDRs), "keys", e.Keys)
 	}
 	if secretsTLS == nil {
 		logger.Warn("serving Secrets over plain HTTP: credentials and Secret values cross the network unencrypted " +

@@ -1,7 +1,7 @@
 // Package gwtest is a fake kube-secret-gateway for tests.
 //
 // It reproduces the parts of the real server's contract that a client depends
-// on, and nothing else: Basic Auth per exposure, the canonical bundle body
+// on, and nothing else: Basic Auth per exposure, the canonical snapshot body
 // (sorted keys, base64 values, no whitespace), an ETag that is HMAC-SHA256 of
 // that body keyed with the Secret's UID, 304 for a matching If-None-Match, and
 // the statuses the server gives when a Secret is not in the expected state.
@@ -33,7 +33,7 @@ type Exposure struct {
 	// UID stands in for the Kubernetes Secret UID that keys the ETag. Changing
 	// it is how a test recreates the Secret.
 	UID string
-	// Status, when not 0, is returned instead of the bundle, for testing how a
+	// Status, when not 0, is returned instead of the exposure, for testing how a
 	// client reacts to 401, 404 or 503.
 	Status int
 }
@@ -91,7 +91,7 @@ func (g *Gateway) Remove(name, key string) {
 	delete(g.exposures[name].Values, key)
 }
 
-// SetStatus makes an exposure answer with status instead of a bundle. Zero
+// SetStatus makes an exposure answer with status instead of a snapshot. Zero
 // restores normal service.
 func (g *Gateway) SetStatus(name string, status int) {
 	g.mu.Lock()
@@ -125,7 +125,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	name, ok := strings.CutPrefix(r.URL.EscapedPath(), "/bundles/")
+	name, ok := strings.CutPrefix(r.URL.EscapedPath(), "/exposures/")
 	if !ok || name == "" || strings.Contains(name, "/") {
 		http.Error(w, "Not Found", http.StatusNotFound)
 		return
@@ -170,7 +170,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// body is the canonical bundle body: keys sorted, values base64, no
+// body is the canonical exposure body: keys sorted, values base64, no
 // whitespace. The real server builds the same bytes, which is what makes the
 // ETag reproducible across replicas.
 func body(values map[string][]byte) []byte {

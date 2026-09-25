@@ -1,61 +1,41 @@
 # kube-secret-gateway-agent
 
-`kube-secret-gateway-agent` is a small host-side service that continuously
-synchronizes Secret bundles from kube-secret-gateway to local files and can
-run a command when those files change.
-
-Suppose cert-manager continuously renews a certificate in Kubernetes, while
-the nginx server that uses it runs on another machine. Without Kube Secret
-Gateway and its agent, you would need to give that machine Kubernetes access,
-copy every renewed certificate manually, or build and operate your own polling
-script. That script would also need to detect changes, keep the certificate
-and private key together, install files safely, survive failures, and reload
-nginx at the right time.
-
-`kube-secret-gateway-agent` provides that host-side synchronization. It polls
-the gateway, installs changed values as local files, and optionally runs a
-command such as `systemctl reload nginx`. The host needs gateway credentials,
-but no Kubernetes credentials or Kubernetes client.
-
-See the [project overview](../README.md) for the full architecture and the
-[gateway guide](../gateway/README.md) for individual-value and bundle API
-usage.
-
-## What the agent does
+ksg-agent is the host-side component of the Kube Secret Gateway stack. It
+fetches exposures from ksg, installs selected values as local files, and can
+reload a service or run an arbitrary command after those files change.
 
 ```text
-Kubernetes Secret -> gateway -> HTTPS -> agent -> local files -> service reload
+Kubernetes Secret -> Exposure -> Local targets
 ```
 
-For each configured bundle, the agent:
+Each request fetches the complete exposure as one atomic snapshot. The
+configured targets decide which returned keys are written locally; extra keys
+are ignored. Target selection is not an authorization boundary because
+ksg-agent already received every key in the exposure - it is simply a way to discard unwanted keys from an exposure.
 
-1. Polls the gateway on its own interval using per-exposure credentials.
-2. Uses an ETag so an unchanged bundle returns `304 Not Modified` without
-   downloading or rewriting anything.
-3. Downloads related values together from one Kubernetes Secret version. A
-   renewed certificate is therefore never fetched separately from its key.
-4. Validates the complete response before touching destination files, then
-   writes and renames each file atomically.
-5. Updates the bundle stamp, optionally runs `onChangeCommand`, and records the
-   completed ETag only after the whole sync succeeds.
-6. Keeps installed files on errors and retries failed fetches or reloads at the
-   next interval.
+Create another server exposure when a client needs different keys,
+credentials, permissions, polling behavior, or reload behavior. Multiple
+exposures may reference the same Kubernetes Secret.
 
-It also detects missing files or incorrect file modes and reinstalls the
-bundle even when the upstream version has not changed. Each bundle can use a
-different polling interval, destination paths, modes, and reload command.
+## What ksg-agent does
 
-## Install the agent
+For each configured exposure, ksg-agent:
 
-The agent is a static binary intended to run on the destination host under
-systemd. Running it on the host lets it write directly to the required paths
-and run commands such as `systemctl reload nginx`.
+1. Polls `GET /exposures/{name}` using the exposure's Basic Auth credentials.
+2. Sends the last completed ETag so unchanged polling returns `304 Not Modified` without transferring values.
+3. Validates that every target key exists before changing any files.
+4. Writes and flushes temporary files, then atomically replaces each target.
+5. Updates the exposure stamp and optionally runs `onChangeCommand`.
+6. Records the new ETag only after the entire synchronization succeeds.
+
+## Install
 
 Download the binary for a published version, verify it against the release
-checksums, and install it. For example, on a Linux AMD64 host:
+checksums, and install it. For example, on Linux AMD64:
 
 ```sh
-version=v0.1.0
+# Example release; replace this with the version you want to install.
+version=v0.2.0
 asset="kube-secret-gateway-agent-${version}-linux-amd64"
 base="https://github.com/kabsdk/kube-secret-gateway/releases/download/${version}"
 
@@ -65,11 +45,9 @@ grep " ${asset}$" SHA256SUMS | sha256sum --check
 sudo install -m 0755 "$asset" /usr/local/bin/kube-secret-gateway-agent
 ```
 
-ARM64 hosts use the otherwise identical `linux-arm64` asset. Releases and
-their checksums are available on the
-[GitHub Releases page](https://github.com/kabsdk/kube-secret-gateway/releases).
+ARM64 hosts use the corresponding `linux-arm64` asset.
 
-Create the configuration directory and install the example files:
+Install the example configuration and systemd service:
 
 ```sh
 sudo install -d -m 0700 /etc/kube-secret-gateway-agent
@@ -79,20 +57,15 @@ sudo install -m 0644 examples/kube-secret-gateway-agent.service \
   /etc/systemd/system/kube-secret-gateway-agent.service
 ```
 
-Edit the configuration and add its credential files, then check everything
-that can be validated locally:
+Edit the configuration, create its password files, and validate it locally:
 
 ```sh
 sudo /usr/local/bin/kube-secret-gateway-agent -check
-```
-
-The check reads the configuration and credentials but does not contact the
-gateway. Once it succeeds, start the agent:
-
-```sh
 sudo systemctl daemon-reload
 sudo systemctl enable --now kube-secret-gateway-agent
 ```
+
+`-check` reads configuration and credentials but does not contact ksg.
 
 ## Configuration
 
@@ -111,34 +84,34 @@ metrics:
 
 exposures:
   - name: my-cert
-    username: fetcher
-    passwordFile: /etc/kube-secret-gateway-agent/my-cert.password
-
-bundles:
-  - name: nginx-tls
-    exposure: my-cert
+    auth:
+      username: fetcher
+      passwordFile: /etc/kube-secret-gateway-agent/my-cert.password
     interval: 24h
+    targets:
+      - key: tls.crt
+        path: /etc/ssl/nginx/tls.crt
+        mode: "0644"
+      - key: tls.key
+        path: /etc/ssl/nginx/tls.key
     onChangeCommand: [systemctl, reload, nginx]
-    files:
-      tls.crt: {path: /etc/ssl/nginx/tls.crt, mode: "0644"}
-      tls.key: /etc/ssl/nginx/tls.key
 ```
 
-The configuration is read at startup. Restart the agent after changing it.
-Credential files are read before every request and can be rotated without a
+Configuration is read at startup. Restart ksg-agent after changing it.
+Password files are read before every request and can be rotated without a
 restart.
 
-### Gateway connection
+### ksg connection
 
 | Field     | Required | Meaning                                                               |
 | --------- | -------- | --------------------------------------------------------------------- |
-| `url`     | yes      | Base URL of the gateway's Secrets listener. A path prefix is allowed. |
+| `url`     | yes      | Base URL of ksg's delivery listener. A path prefix is allowed.        |
 | `caFile`  | no       | PEM CA used instead of the system trust store.                        |
 | `timeout` | no       | Request timeout from `1s` to `10m`; default `30s`.                    |
 
 Use HTTPS whenever the connection leaves an already encrypted, trusted
-network. When `caFile` is set, it replaces rather than extends the system trust
-store for this connection.
+network. When `caFile` is set, it replaces rather than extends the system
+trust store.
 
 ### Metrics listener
 
@@ -146,63 +119,60 @@ store for this connection.
 | --------------- | -------- | -------------------------------------------------------------------- |
 | `listenAddress` | no       | Prometheus listener used in continuous mode; default `0.0.0.0:9091`. |
 
-The default accepts connections on every IPv4 interface so an external
-Prometheus server can scrape the host. Restrict port 9091 to the Prometheus
-servers with the host firewall. Bind to `127.0.0.1:9091` instead when scraping
-through a local collector. One-shot runs do not open the listener because they
-exit after synchronization.
+The default accepts connections on every IPv4 interface. Restrict port 9091
+with the host firewall, or bind to `127.0.0.1:9091` when scraping through a
+local collector. One-shot runs do not open the listener.
 
-### Exposure credentials
+### Exposures
 
-Each entry under `exposures` supplies credentials for an exposure configured
-on the gateway. Exactly one credential source must be used:
+| Field             | Required | Meaning                                                                 |
+| ----------------- | -------- | ----------------------------------------------------------------------- |
+| `name`            | yes      | Exact server exposure name and stable local identity.                   |
+| `auth.username`   | yes      | Non-empty Basic Auth username.                                          |
+| `auth.passwordFile` | yes    | Absolute path to a file containing only the password.                   |
+| `interval`        | no       | Poll interval from `10s` to `168h`; default `5m`.                      |
+| `targets`         | yes      | One or more keys and their local destinations.                          |
+| `onChangeCommand` | no       | Command and arguments run after all targets change.                     |
 
-| Field             | Meaning                                                            |
-| ----------------- | ------------------------------------------------------------------ |
-| `name`            | Exposure name configured on the gateway.                           |
-| `username`        | Basic Auth username used with `passwordFile` or `passwordEnv`.     |
-| `passwordFile`    | Absolute path to a file containing only the password.              |
-| `credentialsFile` | Absolute path to a file containing one `username:password` line.   |
-| `passwordEnv`     | Environment variable containing the password. A file is preferred. |
+Exposure names use Kubernetes DNS-subdomain syntax and must be unique. The
+name is used in request paths, logs, metrics, one-shot selection, and the state filenames
+`{exposure}.etag` and `{exposure}.stamp`.
 
-A trailing newline in a credential file is ignored. Password environment
-variables are removed from the environment inherited by `onChangeCommand`.
+The password file is read immediately before each request. Credentials are
+never placed in URLs, command-line arguments, logs, metrics, or the
+environment.
 
-### Bundles
+### Targets
 
-| Field             | Required | Meaning                                                              |
-| ----------------- | -------- | -------------------------------------------------------------------- |
-| `name`            | yes      | Unique name used in logs and state-file names.                       |
-| `exposure`        | yes      | Exposure to fetch. One bundle maps to one Kubernetes Secret.         |
-| `interval`        | no       | Poll interval from `10s` to `168h`; default `5m`.                    |
-| `files`           | yes      | Map of Secret keys to absolute destination paths and optional modes. |
-| `onChangeCommand` | no       | Command and arguments to run after the files change.                 |
+| Field  | Required | Meaning                                             |
+| ------ | -------- | --------------------------------------------------- |
+| `key`  | yes      | Key from the fetched exposure.                      |
+| `path` | yes      | Absolute destination filename.                      |
+| `mode` | no       | File mode written as an octal string; default `0600`. |
 
-The default file mode is `0600`. A file can use the short form or specify its
-mode explicitly:
+An exposure must have at least one target. Target keys must be unique within
+the exposure, and destination paths must be unique across the complete
+configuration. Paths are lexically normalized before this uniqueness check.
 
-```yaml
-files:
-  tls.key: /etc/ssl/nginx/tls.key
-  tls.crt: {path: /etc/ssl/nginx/tls.crt, mode: "0644"}
+`onChangeCommand` is executed directly without a shell. If it fails, the
+files remain installed and the exposure is retried at its next interval. The
+timeout is controlled by `-command-timeout` and defaults to two minutes.
+
+## Running
+
+Without `-once`, ksg-agent polls each exposure on its own interval. A failure
+in one exposure does not stop the others.
+
+Use `-once` when systemd or cron owns the schedule. Exposure intervals are
+ignored in one-shot mode. Use `-exposure` to select one or more configured
+exposures:
+
+```sh
+kube-secret-gateway-agent -once -exposure my-cert,app-token
 ```
 
-No two bundles may write the same destination path.
-
-`onChangeCommand` is executed directly, without a shell. If it fails, the
-bundle is retried at its next interval. The timeout is controlled by
-`-command-timeout` and defaults to two minutes.
-
-## Running the agent
-
-Without `-once`, the agent runs continuously and polls each bundle on its own
-interval. A failure in one bundle is logged and retried without stopping the
-others.
-
-Use `-once` when systemd or cron should own the schedule. The example
-`kube-secret-gateway-agent-once.service` and `.timer` files show this setup.
-Bundle intervals are ignored in one-shot mode. `-bundle` can restrict a run to
-one or more named bundles.
+The example `kube-secret-gateway-agent-once.service` and `.timer` files show
+the systemd setup.
 
 ### Reloading services
 
@@ -212,122 +182,93 @@ The simplest option is to configure the reload directly:
 onChangeCommand: [systemctl, reload, nginx]
 ```
 
-To keep service control separate from the agent, omit `onChangeCommand` and
-use a systemd path unit to watch the bundle's stamp file. Examples are provided
-in `examples/nginx-reload.path` and `examples/nginx-reload.service`.
+To keep service control separate from ksg-agent, omit `onChangeCommand` and
+use a systemd path unit to watch the exposure stamp. Examples are provided in
+`examples/nginx-reload.path` and `examples/nginx-reload.service`.
 
-Watch the stamp rather than an individual destination file. The stamp changes
-only after every configured destination file has been replaced.
+Watch the stamp rather than an individual target. The stamp changes only after
+every configured target has been replaced.
 
 ## Prometheus metrics
 
-In continuous mode, the agent serves Prometheus metrics at `/metrics` on the
-configured metrics listener. With the default configuration:
+In continuous mode, ksg-agent serves Prometheus metrics at `/metrics` on the
+configured listener.
 
-```text
-http://HOST:9091/metrics
-```
+| Metric                                                             | Meaning                                                                |
+| ------------------------------------------------------------------ | ---------------------------------------------------------------------- |
+| `kube_secret_gateway_agent_exposure_healthy`                       | Whether the latest synchronization attempt succeeded.                  |
+| `kube_secret_gateway_agent_sync_attempts_total`                    | Synchronization attempts.                                              |
+| `kube_secret_gateway_agent_sync_errors_total`                      | Failed synchronization attempts.                                       |
+| `kube_secret_gateway_agent_changes_total`                          | Successful synchronizations that installed changed targets.            |
+| `kube_secret_gateway_agent_last_attempt_timestamp_seconds`         | Time of the latest attempt.                                             |
+| `kube_secret_gateway_agent_last_successful_sync_timestamp_seconds` | Time of the latest successful synchronization, including `304`.         |
+| `kube_secret_gateway_agent_last_change_timestamp_seconds`          | Time targets were last installed successfully.                          |
+| `kube_secret_gateway_agent_sync_duration_seconds`                  | Histogram of synchronization duration.                                 |
+| `kube_secret_gateway_agent_build_info`                             | Running ksg-agent version.                                             |
 
-The endpoint includes standard Go and process metrics plus:
-
-| Metric                                                             | Meaning                                                              |
-| ------------------------------------------------------------------ | -------------------------------------------------------------------- |
-| `kube_secret_gateway_agent_bundle_healthy`                         | Whether the latest sync attempt succeeded.                           |
-| `kube_secret_gateway_agent_sync_attempts_total`                    | Synchronization attempts.                                            |
-| `kube_secret_gateway_agent_sync_errors_total`                      | Failed synchronization attempts.                                     |
-| `kube_secret_gateway_agent_changes_total`                          | Successful syncs that installed changed files.                       |
-| `kube_secret_gateway_agent_last_attempt_timestamp_seconds`         | Time of the latest attempt.                                          |
-| `kube_secret_gateway_agent_last_successful_sync_timestamp_seconds` | Time of the latest successful sync, including an unchanged response. |
-| `kube_secret_gateway_agent_last_change_timestamp_seconds`          | Time files were last installed successfully.                         |
-| `kube_secret_gateway_agent_sync_duration_seconds`                  | Histogram of synchronization duration.                               |
-| `kube_secret_gateway_agent_build_info`                             | Running agent version.                                               |
-
-Per-bundle metrics use only configured bundle names as labels. Secret values,
-credentials, destination paths, and command output are never exposed.
-
-A basic Prometheus scrape configuration for an externally reachable listener
-is:
-
-```yaml
-scrape_configs:
-  - job_name: kube-secret-gateway-agent
-    static_configs:
-      - targets: [host.example.com:9091]
-```
+Every synchronization metric uses the configured `exposure` name as its only
+identity label. Secret values, credentials, destination paths, and command
+output are never exposed.
 
 ## Update and failure behavior
 
-When a bundle changes, the agent first checks that the response contains every
-configured key. It then writes each value to a temporary file beside its
-destination, flushes the file, and renames it over the destination. After all
-renames have completed, it updates the stamp and runs the change command. The
-new ETag is recorded only after the entire sync succeeds.
+ksg-agent validates the complete response before touching any targets. It
+writes each value to a temporary file beside its destination, flushes it, and
+renames it over the destination. Each replacement is atomic, but the targets
+as a group are not a filesystem transaction.
 
-Each destination file is replaced atomically and is never left half-written.
-The files as a group are not a filesystem transaction: a crash between
-renames can leave files from different versions. Because the ETag is recorded
-last, the next run detects the incomplete sync and installs the complete
-bundle again. Reload commands and stamp watchers run only after all renames
-have completed.
+If a crash occurs between renames, the ETag has not yet been committed. The
+next run fetches the complete exposure and repairs every target. Reload
+commands and stamp watchers run only after all replacements finish.
 
-Fetch and validation errors leave the installed files untouched. A reload
-failure leaves the new files installed but does not commit the ETag, so the
-agent installs the bundle and tries the reload again at the next interval. A
-missing or deleted upstream Secret does not delete files already installed on
-the host. Kube Secret Gateway distributes Secret values; it cannot revoke
-copies that have already been delivered.
-
-The state directory is `/var/lib/kube-secret-gateway-agent` by default and
-contains two files per bundle:
-
-- `{bundle}.etag` records the last completed sync.
-- `{bundle}.stamp` changes after all destination files have been replaced.
+Fetch and validation errors leave installed files untouched. A reload failure
+leaves new files installed but does not commit the ETag, so the next interval
+reinstalls the targets and retries the reload. A missing upstream Secret does
+not delete files already installed on the host.
 
 ## Troubleshooting
 
-The agent logs to standard error, which the provided service sends to the
+ksg-agent logs to standard error, which the provided service sends to the
 systemd journal:
 
 ```sh
 journalctl -u kube-secret-gateway-agent
 ```
 
-Common gateway responses are:
+| Status | What to check                                                                                                  |
+| ------ | -------------------------------------------------------------------------------------------------------------- |
+| `401`  | The exposure username or password is incorrect.                                                                |
+| `404`  | The exposure name is wrong or the host is outside its `allowedCidrs`.                                         |
+| `503`  | A source or authentication Secret is missing or incomplete; check ksg logs and metrics.                       |
 
-| Status | What to check                                                                                                             |
-| ------ | ------------------------------------------------------------------------------------------------------------------------- |
-| `401`  | The exposure username or password is incorrect.                                                                           |
-| `404`  | The exposure name is wrong, the host is outside its `allowedCidrs`, or the gateway does not provide the bundle endpoint.  |
-| `503`  | The source or authentication Secret is missing or does not contain the expected keys. Check the gateway logs and metrics. |
-
-`-check` confirms that credentials can be read locally; it cannot confirm that
-the gateway will accept them.
+`-check` confirms that password files can be read locally; it cannot confirm
+that ksg accepts the credentials.
 
 ## Command reference
 
 | Flag               | Default                                      | Meaning                                                                |
 | ------------------ | -------------------------------------------- | ---------------------------------------------------------------------- |
 | `-config`          | `/etc/kube-secret-gateway-agent/config.yaml` | Configuration file.                                                    |
-| `-state-dir`       | `/var/lib/kube-secret-gateway-agent`         | ETag and stamp files.                                                  |
-| `-once`            | off                                          | Synchronize selected bundles once and exit.                            |
-| `-bundle`          | all                                          | Comma-separated bundle names to synchronize.                           |
-| `-check`           | off                                          | Validate configuration and credentials without contacting the gateway. |
+| `-state-dir`       | `/var/lib/kube-secret-gateway-agent`         | Per-exposure ETag and stamp files.                                     |
+| `-once`            | off                                          | Synchronize selected exposures once and exit.                          |
+| `-exposure`        | all                                          | Comma-separated exposure names to synchronize.                         |
 | `-command-timeout` | `2m`                                         | Maximum runtime for `onChangeCommand`.                                 |
-| `-log-level`       | `info`                                       | `debug`, `info`, `warn`, or `error`.                                   |
-| `-log-format`      | `text`                                       | `text` or `json`.                                                      |
+| `-check`           | off                                          | Validate configuration and credentials without contacting ksg.        |
+| `-log-level`       | `info`                                       | `debug`, `info`, `warn`, or `error`.                                 |
+| `-log-format`      | `text`                                       | `text` or `json`.                                                       |
 | `-version`         |                                              | Print the version.                                                     |
 
-Exit status is `0` for success, `1` when a one-shot sync fails, and `2` for
-invalid arguments, configuration, or credentials.
+Exit status is `0` for success, `1` when a one-shot synchronization fails,
+and `2` for invalid arguments, configuration, or credentials.
 
 ## Limitations
 
-- A bundle contains keys from one Kubernetes Secret. There is no consistent
-  snapshot across multiple Secrets.
-- The agent sets file modes but not owner or group.
+- One exposure comes from one Kubernetes Secret.
+- ksg-agent sets file modes but not owner or group.
 - Configuration changes require a restart.
-- Metrics are available only while the agent runs continuously. Monitor
-  one-shot services through their exit status and systemd timer state.
+- Metrics are available only in continuous mode. Monitor one-shot services
+  through their exit status and systemd timer state.
+- ksg distributes values; it cannot revoke copies already delivered.
 
 ## Development
 
@@ -337,17 +278,9 @@ From the `agent/` directory:
 go test ./...
 go test -race ./...
 go vet ./...
-```
-
-Tests use an in-memory gateway and do not require Kubernetes or network
-access. The agent and gateway test suites both pin the bundle wire format.
-
-Build a local development binary with:
-
-```sh
 go build -o kube-secret-gateway-agent ./cmd/kube-secret-gateway-agent
 ```
 
-Maintainers can use `scripts/build-release.sh` to create cross-platform
-binaries and a `SHA256SUMS` file. Published artifacts are produced by the
-repository release workflow.
+Tests use an in-memory ksg and require no Kubernetes or external network
+access. Maintainers can use `scripts/build-release.sh` to create
+cross-platform binaries and a `SHA256SUMS` file.

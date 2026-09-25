@@ -9,19 +9,18 @@ kubernetes:
   defaultNamespace: kube-secret-gateway
   reconcileInterval: 5m
 
-secrets:
-  # This exposure serves the my-cert Secret under the public name my-cert.
+exposures:
+  # This exposure projects two keys from the my-cert Kubernetes Secret.
   # Replace this documentation address with the destination host's address,
   # or with the address preserved by your trusted reverse proxy.
   - name: my-cert
     secretRef:
       name: my-cert
+    keys:
+      - tls.crt
+      - tls.key
     allowedCidrs:
       - 192.0.2.10/32
     auth:
-      type: basicAuth
       secretRef:
         name: my-cert-fetcher
-    includeKeys:
-      - tls.crt
-      - tls.key

@@ -1,8 +1,7 @@
 # Releasing Kube Secret Gateway
 
-Kube Secret Gateway and its agent share one version. A release publishes the
-gateway as a container image and the agent as static host binaries, all built
-from the same Git tag.
+ksg and ksg-agent share one version. A release publishes ksg as a container
+image and ksg-agent as static host binaries, all built from the same Git tag.
 
 ## Version policy
 
@@ -20,24 +19,21 @@ overwrite its container tag. Publish a new patch version instead. The
 `latest` container tag is the only moving release tag and is updated only by
 stable releases.
 
-## One-time repository setup
-
-Before the first public release:
-
-1. Enable GitHub Actions and allow workflows to create packages and releases.
-2. After the first GHCR package is created, make
-   `ghcr.io/kabsdk/kube-secret-gateway` public and connect it to this
-   repository if GitHub has not done so automatically.
-3. Enable immutable releases in the repository settings.
-4. Protect `main` and require the `CI / Test and build` check before merging.
-
-The workflows use the repository's `GITHUB_TOKEN`; no registry password or
-release token is required.
-
 ## Create a release
 
-Release only a commit already merged to `main` with a passing CI run. Start
-from an up-to-date, clean checkout:
+Prepare the changelog on the PR branch before merging the release to `main`:
+
+1. Confirm that `[Unreleased]` contains every change since the previous
+   release.
+2. Add a new empty `[Unreleased]` section and move the existing entries under
+   `[vX.Y.Z] - YYYY-MM-DD`.
+3. Change the `[Unreleased]` comparison link to start at `vX.Y.Z` and add a
+   comparison link from the previous version to `vX.Y.Z`.
+4. Commit the changelog as part of the PR, let CI pass, and merge the PR.
+
+Tag promptly after merging so no unrelated commits land between the release
+commit and its tag. Release only a commit already merged to `main`. From an
+up-to-date, clean checkout:
 
 ```sh
 git switch main
@@ -45,20 +41,22 @@ git pull --ff-only
 git status --short
 ```
 
-Choose the next version, review the changes since the previous release, then
-create and push an annotated tag:
+Verify that `HEAD` is the intended release commit, then create and push an
+annotated tag:
 
 ```sh
-git tag -a v0.1.0 -m "v0.1.0"
-git push origin v0.1.0
+# Example release; replace this with the version being published.
+version=v0.2.0
+git tag -a "$version" -m "$version"
+git push origin "$version"
 ```
 
 The release workflow validates the tag, reruns all checks, and publishes:
 
-- `ghcr.io/kabsdk/kube-secret-gateway:v0.1.0` for Linux AMD64 and ARM64;
+- `ghcr.io/kabsdk/kube-secret-gateway:vX.Y.Z` for Linux AMD64 and ARM64;
 - `ghcr.io/kabsdk/kube-secret-gateway:latest` for a stable release;
-- `kube-secret-gateway-agent-v0.1.0-linux-amd64`;
-- `kube-secret-gateway-agent-v0.1.0-linux-arm64`; and
+- `kube-secret-gateway-agent-vX.Y.Z-linux-amd64`;
+- `kube-secret-gateway-agent-vX.Y.Z-linux-arm64`; and
 - `SHA256SUMS` alongside automatically generated release notes.
 
 Prereleases publish their exact image tag and GitHub release assets but do not
@@ -69,8 +67,10 @@ update `latest`.
 Check the release page and inspect the multi-platform image:
 
 ```sh
-gh release view v0.1.0
-docker buildx imagetools inspect ghcr.io/kabsdk/kube-secret-gateway:v0.1.0
+# Example release; replace this with the version that was published.
+version=v0.2.0
+gh release view "$version"
+docker buildx imagetools inspect "ghcr.io/kabsdk/kube-secret-gateway:$version"
 ```
 
 Deployments should pin an exact version or image digest. The Ansible role

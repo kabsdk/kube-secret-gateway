@@ -1,89 +1,81 @@
 # Kube Secret Gateway
 
-Kube Secret Gateway exposes selected Kubernetes Secret data through an
-authenticated HTTP API. It is designed for software outside a cluster that
-needs a secret without receiving Kubernetes credentials or direct access to
-the Kubernetes API.
+Kube Secret Gateway (ksg) serves selected Kubernetes Secrets to servers outside your
+cluster through a controlled, authenticated HTTP(S) API with a minimal
+blast radius. Using kube-secret-gateway-agent (ksg-agent), those Secrets are predictably synchronized to
+local files.
 
-A client can fetch one value from a Secret or fetch several values together as
-a consistent bundle. The API can be used directly with any HTTP client. When
-values need to remain synchronized with files on a host, the optional agent
-polls the bundle endpoint and can reload the consuming service after a change.
+# Purpose
 
-| Component                                        | Runs                  | Purpose                                                                                          |
-| ------------------------------------------------ | --------------------- | ------------------------------------------------------------------------------------------------ |
-| [**kube-secret-gateway**](gateway/README.md)     | In Kubernetes         | Watches explicitly configured Secrets and exposes them through the HTTP API.                     |
-| [**kube-secret-gateway-agent**](agent/README.md) | On a destination host | Polls the gateway, writes changed values to files, and optionally reloads the consuming service. |
+If you are anything like me, you probably have a tight grip on certificate management in
+Kubernetes. You know: cert-manager, Prometheus metrics, Grafana alerts and whatnot.
+You are probably the type to know exactly when something is wrong and that's what I like about you!
 
-```text
-Kubernetes Secrets -> gateway HTTP API -> direct clients
-                              |
-                              +-> agent -> local files -> service reload
-```
+Then, you suddenly need to configure something on a server outside the cluster - you know,
+some half-forgotten server running a god-knows-how-old docker-compose stack. You need
+to serve some webpage from it, so of course it needs a TLS certificate. At this
+point, you only really have four options:
 
-The gateway exposes only explicitly selected Secrets and keys. Kubernetes RBAC
-still controls what the gateway itself may read. The gateway stores values
-only in memory and never writes them to disk.
+- Install another ACME client directly on your half-forgotten server, copy over
+  the Cloudflare credentials, and hope and pray its renewal job keeps working.
+- Implement an **entire** secret manager such as OpenBao for the single purpose
+  of fetching a certificate once a week from your cluster.
+- Copy the secret manually once in a while when it's renewed.
+- Open up kube-api access, configure RBAC and hope that you haven't misconfigured it.
 
-Both long-running components expose Prometheus metrics: the gateway reports
-Secret, watch, and HTTP state, while the agent reports synchronization health
-for each configured bundle. Neither endpoint exposes Secret values.
-
-## Repository layout
+ksg closes that gap: keep ACME and its monitoring in one
+place (where you already have it, in Kubernetes), then distribute each renewed certificate only where and when it is needed.
 
 ```text
-gateway/   Gateway server, container image, Kubernetes examples and API docs
-agent/     Host agent, systemd examples and synchronization docs
+cert-manager -> Kubernetes Secret -> ksg -> ksg-agent -> local files -> service reload
 ```
 
-The components are separate Go modules joined by the root `go.work`. They have
-independent dependencies and release artifacts, while the gateway's end-to-end
-tests build and exercise the real agent.
+The blast radius is intentionally small. Clients never receive Kubernetes
+API credentials, and ksg exposes only the Secrets and keys you configure.
+Each exposure has a network allow-list and Basic Auth, while Kubernetes RBAC
+limits what ksg itself can read from the cluster. There is no exposure-listing API, and
+Secret values stay in memory.
 
-## Documentation
+Both ksg and ksg-agent expose Prometheus metrics, so monitoring does not
+end at the cluster boundary.
 
-- Start with the [gateway guide](gateway/README.md) to configure the API,
-  deploy it in Kubernetes, and fetch individual values or bundles.
-- Use the [agent guide](agent/README.md) when a host needs continuous file
-  synchronization or a command such as `systemctl reload nginx` after an
-  update.
-- Consult the [gateway reference](gateway/REFERENCE.md) for the complete HTTP
-  contract, proxy behavior, TLS, metrics, and security details.
+## Components
 
-Versioned releases publish the gateway image at
-`ghcr.io/kabsdk/kube-secret-gateway` and attach host-agent binaries and
-checksums to the corresponding
-[GitHub Release](https://github.com/kabsdk/kube-secret-gateway/releases).
-Maintainers can find the version policy and release procedure in
-[RELEASING.md](RELEASING.md).
+| Component                                        | Runs                  | Purpose                                                                           |
+| ------------------------------------------------ | --------------------- | --------------------------------------------------------------------------------- |
+| [**kube-secret-gateway**](gateway/README.md)     | In Kubernetes         | Exposes configured Secrets through the HTTP API.                                  |
+| [**kube-secret-gateway-agent**](agent/README.md) | On a destination host | Synchronizes Secrets to files and optionally reloads the service that uses them.  |
 
-The gateway is a distribution service, not a general secret manager. It does
-not create or modify Secrets, and a value already delivered to a client cannot
-be remotely revoked.
+ksg can also be used directly without ksg-agent.
 
-Kube Secret Gateway is licensed under the
-[Apache License 2.0](LICENSE).
+## Get started
+
+- Follow the [ksg guide](gateway/README.md) to configure and deploy the
+  API.
+- Follow the [ksg-agent guide](agent/README.md) to synchronize files on an
+  external host.
+- See the [ksg reference](gateway/REFERENCE.md) for the complete API,
+  configuration, TLS, proxy, metrics, and security details.
+
+Releases publish the ksg container image at
+`ghcr.io/kabsdk/kube-secret-gateway` and attach ksg-agent binaries and checksums to
+[GitHub Releases](https://github.com/kabsdk/kube-secret-gateway/releases).
+See [CHANGELOG.md](CHANGELOG.md) for release history and breaking changes.
+
+ksg distributes Secrets; it does not create, modify, or revoke
+them.
 
 ## Development
 
-Run checks for both components from the repository root:
+ksg and ksg-agent are separate Go modules joined by the root `go.work`.
 
 ```sh
 make check
 make test-race
-```
-
-The test suites use fake Kubernetes and HTTP servers; no cluster is required.
-Build the two binaries with:
-
-```sh
 make build
 ```
 
-The binaries are written to `dist/`.
+The tests require no Kubernetes cluster. Built binaries are written to
+`dist/`. See [RELEASING.md](RELEASING.md) for the release process.
 
-Build the gateway container from its module directory:
-
-```sh
-docker build -t kube-secret-gateway:dev gateway
-```
+Licensed under the [Apache License 2.0](LICENSE).

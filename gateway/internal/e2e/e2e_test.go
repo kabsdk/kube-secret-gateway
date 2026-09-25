@@ -31,21 +31,24 @@ const agentModule = "../../../agent"
 const gatewayConfig = `
 kubernetes:
   defaultNamespace: certificates
-secrets:
-  - secretRef: {name: my-cert}
+exposures:
+  - name: my-cert
+    secretRef: {name: my-cert}
+    keys: [tls.crt, tls.key, ca.crt]
     allowedCidrs: [127.0.0.1/32, "::1/128"]
-    auth: {type: basicAuth, secretRef: {namespace: certificate-auth, name: fetcher}}
+    auth: {secretRef: {namespace: certificate-auth, name: fetcher}}
 
   - name: strict
     secretRef: {name: strict-cert}
+    keys: [tls.crt, tls.key]
     allowedCidrs: [127.0.0.1/32, "::1/128"]
-    auth: {type: basicAuth, secretRef: {namespace: certificate-auth, name: fetcher}}
-    includeKeys: [tls.crt, tls.key]
+    auth: {secretRef: {namespace: certificate-auth, name: fetcher}}
 
   - name: elsewhere
     secretRef: {name: my-cert}
+    keys: [tls.crt]
     allowedCidrs: [10.0.0.0/8]
-    auth: {type: basicAuth, secretRef: {namespace: certificate-auth, name: fetcher}}
+    auth: {secretRef: {namespace: certificate-auth, name: fetcher}}
 `
 
 var (
@@ -158,7 +161,7 @@ func start(t *testing.T, password string) *env {
 	t.Cleanup(gw.Close)
 
 	passwordFile := filepath.Join(e.dir, "password")
-	if err := os.WriteFile(passwordFile, []byte(password+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(passwordFile, []byte(password), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	e.configPath = filepath.Join(e.dir, "config.yaml")
@@ -166,24 +169,20 @@ func start(t *testing.T, password string) *env {
 gateway:
   url: %[1]s
 exposures:
-  - {name: my-cert, username: fetcher, passwordFile: %[2]s}
-  - {name: strict, username: fetcher, passwordFile: %[2]s}
-  - {name: elsewhere, username: fetcher, passwordFile: %[2]s}
-bundles:
-  - name: tls
-    exposure: my-cert
-    files:
-      tls.crt: {path: %[3]s/tls.crt, mode: "0644"}
-      tls.key: %[3]s/tls.key
+  - name: my-cert
+    auth: {username: fetcher, passwordFile: %[2]s}
+    targets:
+      - {key: tls.crt, path: %[3]s/tls.crt, mode: "0644"}
+      - {key: tls.key, path: %[3]s/tls.key}
   - name: strict
-    exposure: strict
-    files:
-      tls.crt: %[3]s/strict.crt
-      tls.key: %[3]s/strict.key
+    auth: {username: fetcher, passwordFile: %[2]s}
+    targets:
+      - {key: tls.crt, path: %[3]s/strict.crt}
+      - {key: tls.key, path: %[3]s/strict.key}
   - name: elsewhere
-    exposure: elsewhere
-    files:
-      tls.crt: %[3]s/elsewhere.crt
+    auth: {username: fetcher, passwordFile: %[2]s}
+    targets:
+      - {key: tls.crt, path: %[3]s/elsewhere.crt}
 `, gw.URL, passwordFile, e.dir)
 	if err := os.WriteFile(e.configPath, []byte(agentConfig), 0o600); err != nil {
 		t.Fatal(err)
@@ -201,12 +200,12 @@ func (r *statusRecorder) WriteHeader(status int) {
 	r.ResponseWriter.WriteHeader(status)
 }
 
-// sync runs the agent once for one bundle and returns its exit code and
+// sync runs the agent once for one exposure and returns its exit code and
 // log output.
-func (e *env) sync(bundle string) (int, string) {
+func (e *env) sync(exposure string) (int, string) {
 	e.t.Helper()
 	var out bytes.Buffer
-	cmd := exec.Command(e.binary, "-config", e.configPath, "-state-dir", e.stateDir, "-once", "-bundle", bundle)
+	cmd := exec.Command(e.binary, "-config", e.configPath, "-state-dir", e.stateDir, "-once", "-exposure", exposure)
 	cmd.Stdout, cmd.Stderr = &out, &out
 	err := cmd.Run()
 	var exit *exec.ExitError
@@ -223,9 +222,9 @@ func (e *env) sync(bundle string) (int, string) {
 
 // mustSync runs the agent and expects success, returning the status the
 // gateway answered it with.
-func (e *env) mustSync(bundle string) int {
+func (e *env) mustSync(exposure string) int {
 	e.t.Helper()
-	if code, out := e.sync(bundle); code != 0 {
+	if code, out := e.sync(exposure); code != 0 {
 		e.t.Fatalf("agent exited %d:\n%s", code, out)
 	}
 	e.mu.Lock()
@@ -276,7 +275,7 @@ func (e *env) expectAbsent(name string) {
 func TestInstallPollRotate(t *testing.T) {
 	e := start(t, "s3cret")
 
-	if got := e.mustSync("tls"); got != http.StatusOK {
+	if got := e.mustSync("my-cert"); got != http.StatusOK {
 		t.Fatalf("first sync answered %d, want 200", got)
 	}
 	e.expectFiles("CERT-1", "KEY-1")
@@ -284,19 +283,19 @@ func TestInstallPollRotate(t *testing.T) {
 		t.Fatalf("tls.crt mode: %v %v", info, err)
 	}
 
-	if got := e.mustSync("tls"); got != http.StatusNotModified {
+	if got := e.mustSync("my-cert"); got != http.StatusNotModified {
 		t.Fatalf("unchanged poll answered %d, want 304", got)
 	}
 
-	// A key the client does not install still changes the bundle's tag: one
+	// A key the client does not install still changes the exposure's tag: one
 	// tag covers the whole set.
 	e.apply(certRef, map[string][]byte{"tls.crt": []byte("CERT-1"), "tls.key": []byte("KEY-1"), "ca.crt": []byte("CA-2")})
-	if got := e.mustSync("tls"); got != http.StatusOK {
+	if got := e.mustSync("my-cert"); got != http.StatusOK {
 		t.Fatalf("after ca.crt changed: answered %d, want 200", got)
 	}
 
 	e.apply(certRef, map[string][]byte{"tls.crt": []byte("CERT-2"), "tls.key": []byte("KEY-2"), "ca.crt": []byte("CA-2")})
-	if got := e.mustSync("tls"); got != http.StatusOK {
+	if got := e.mustSync("my-cert"); got != http.StatusOK {
 		t.Fatalf("after renewal: answered %d, want 200", got)
 	}
 	e.expectFiles("CERT-2", "KEY-2")
@@ -306,7 +305,7 @@ func TestInstallPollRotate(t *testing.T) {
 	e.api.Delete(certRef)
 	e.eventually(func() bool { return !e.mgr.Secret(certRef).Present })
 	e.apply(certRef, map[string][]byte{"tls.crt": []byte("CERT-2"), "tls.key": []byte("KEY-2"), "ca.crt": []byte("CA-2")})
-	if got := e.mustSync("tls"); got != http.StatusOK {
+	if got := e.mustSync("my-cert"); got != http.StatusOK {
 		t.Fatalf("after recreation: answered %d, want 200", got)
 	}
 	e.expectFiles("CERT-2", "KEY-2")
@@ -315,15 +314,15 @@ func TestInstallPollRotate(t *testing.T) {
 // TestFailuresInstallNothing covers the statuses the agent has to tell apart.
 // None of them may touch a file.
 func TestFailuresInstallNothing(t *testing.T) {
-	expectFailure := func(t *testing.T, e *env, bundle, status string) {
+	expectFailure := func(t *testing.T, e *env, exposure, status string) {
 		t.Helper()
-		code, out := e.sync(bundle)
+		code, out := e.sync(exposure)
 		if code != 1 || !strings.Contains(out, status) {
 			t.Fatalf("agent exited %d, want 1 with a %s:\n%s", code, status, out)
 		}
 	}
 
-	t.Run("503 when includeKeys promises a missing key", func(t *testing.T) {
+	t.Run("503 when a configured key is missing", func(t *testing.T) {
 		e := start(t, "s3cret")
 		e.apply(strictRef, map[string][]byte{"tls.crt": []byte("STRICT-CERT")})
 		expectFailure(t, e, "strict", "503")
@@ -337,7 +336,7 @@ func TestFailuresInstallNothing(t *testing.T) {
 
 	t.Run("401 for a wrong password", func(t *testing.T) {
 		e := start(t, "wrong")
-		expectFailure(t, e, "tls", "401")
+		expectFailure(t, e, "my-cert", "401")
 		e.expectAbsent("tls.crt")
 	})
 
