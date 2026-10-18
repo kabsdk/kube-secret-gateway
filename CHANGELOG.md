@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [v0.2.1] - 2026-10-18
+
+### Changed
+
+- Rewrote the README introduction and purpose around a rotated database
+  credential example, and stated that no ksg configuration can give clients
+  access to the Kubernetes API.
+
 ## [v0.2.0] - 2026-09-25
 
 ### Breaking
@@ -35,6 +43,7 @@ Initial release of ksg and ksg-agent, including authenticated Secret delivery,
 atomic host-file synchronization, Kubernetes watches and RBAC, TLS, Prometheus
 metrics, systemd examples, CI, and versioned release artifacts.
 
-[Unreleased]: https://github.com/kabsdk/kube-secret-gateway/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/kabsdk/kube-secret-gateway/compare/v0.2.1...HEAD
+[v0.2.1]: https://github.com/kabsdk/kube-secret-gateway/compare/v0.2.0...v0.2.1
 [v0.2.0]: https://github.com/kabsdk/kube-secret-gateway/compare/v0.1.0...v0.2.0
 [v0.1.0]: https://github.com/kabsdk/kube-secret-gateway/releases/tag/v0.1.0
