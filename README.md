@@ -1,40 +1,60 @@
 # Kube Secret Gateway
 
-Kube Secret Gateway (ksg) serves selected Kubernetes Secrets to servers outside your
-cluster through a controlled, authenticated HTTP(S) API with a minimal
-blast radius. Using kube-secret-gateway-agent (ksg-agent), those Secrets are predictably synchronized to
-local files.
+Kube Secret Gateway (ksg) delivers Kubernetes Secrets to servers outside the cluster
+and keeps them up to date. You configure *exposures*: each one names a Secret, the
+keys to share from it, and who may fetch them. ksg serves exactly those keys over an
+authenticated HTTP(S) API.
+
+On the receiving server, kube-secret-gateway-agent (ksg-agent) fetches the exposure,
+writes each value to a local file and, whenever the values change, reloads or
+restarts the service that uses them.
 
 # Purpose
 
-If you are anything like me, you probably have a tight grip on certificate management in
-Kubernetes. You know: cert-manager, Prometheus metrics, Grafana alerts and whatnot.
-You are probably the type to know exactly when something is wrong and that's what I like about you!
+If you are anything like me, you have secrets in Kubernetes well under control. An
+operator generates your database credentials, rotates them on a schedule, and every
+workload in the cluster picks up the new Secret automatically. The one exception is
+the reporting server outside the cluster running docker compose, where Gary has deployed
+the rotated password manually twice a month.
 
-Then, you suddenly need to configure something on a server outside the cluster - you know,
-some half-forgotten server running a god-knows-how-old docker-compose stack. You need
-to serve some webpage from it, so of course it needs a TLS certificate. At this
-point, you only really have four options:
+That server runs the nightly reporting job that finance swears is business-critical.
+The automation that rotates the Postgres credentials stops at the cluster boundary;
+like most in-cluster automation, it was never designed to reach beyond it. Extending
+it to servers outside the cluster would mean giving something in the cluster SSH
+access to the server, or worse, setting up an FTP drop. So after every rotation, Gary
+copies the new password out of the Secret, pastes it into the server's `.env` file
+and restarts the stack. It works, as long as Gary remembers, isn't on holiday and gets every character
+right.
 
-- Install another ACME client directly on your half-forgotten server, copy over
-  the Cloudflare credentials, and hope and pray its renewal job keeps working.
+To take Gary out of the loop, you only really have three options:
+
+- Turn off rotation for that user, so there is nothing left to deploy.
 - Implement an **entire** secret manager such as OpenBao for the single purpose
-  of fetching a certificate once a week from your cluster.
-- Copy the secret manually once in a while when it's renewed.
-- Open up kube-api access, configure RBAC and hope that you haven't misconfigured it.
+  of handing one password to one server.
+- Open up kube-api access, configure RBAC, hope that you haven't misconfigured it,
+  and have the server fetch the Secret itself with a shell script that handles every
+  error case. And when that script fails, it fails silently: your alerting stack won't
+  notice it.
 
-ksg closes that gap: keep ACME and its monitoring in one
-place (where you already have it, in Kubernetes), then distribute each renewed certificate only where and when it is needed.
+ksg is the fourth option: keep the credentials where they are created and rotated
+(where you already have them, in Kubernetes), and let ksg-agent install each new
+version on the hosts that need it. Every rotation reaches the server the same way,
+within one polling interval, without anyone involved. The Postgres username and
+password come straight from the Kubernetes Secret as one snapshot, and the service
+is only restarted once both are in place.
 
 ```text
-cert-manager -> Kubernetes Secret -> ksg -> ksg-agent -> local files -> service reload
+database operator -> Kubernetes Secret -> ksg -> ksg-agent -> local files -> service restart
 ```
 
-The blast radius is intentionally small. Clients never receive Kubernetes
-API credentials, and ksg exposes only the Secrets and keys you configure.
-Each exposure has a network allow-list and Basic Auth, while Kubernetes RBAC
-limits what ksg itself can read from the cluster. There is no exposure-listing API, and
-Secret values stay in memory.
+Unlike opening up kube-api access, no ksg configuration can give clients access to
+the Kubernetes API. ksg answers a single endpoint, `GET|HEAD /exposures/{name}`, from
+memory; it never forwards requests to Kubernetes and never hands out its own
+credentials. The worst a configuration mistake can do is expose the wrong Secret,
+and Kubernetes RBAC limits which Secrets ksg can read in the first place.
+
+Each exposure has a network allow-list and Basic Auth, there is no API for listing
+exposures, and Secret values stay in memory.
 
 Both ksg and ksg-agent expose Prometheus metrics, so monitoring does not
 end at the cluster boundary.
